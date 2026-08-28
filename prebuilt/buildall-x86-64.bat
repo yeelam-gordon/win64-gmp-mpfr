@@ -424,7 +424,7 @@ SET "NMAKE_EXE="
 FOR %%I IN (nmake.exe) DO SET "NMAKE_EXE=%%~$PATH:I"
 IF NOT DEFINED NMAKE_EXE GOTO RUN_NMAKE_MISSING
 FOR %%I IN ("%NMAKE_EXE%") DO IF /I NOT "%%~fI"=="%NMAKE_EXE%" GOTO RUN_NMAKE_MISSING
-SET "PATH=%PATH%;%CD%"
+SET "PATH=%CD%;%PATH%"
 CALL :RUN "%NMAKE_EXE%" %*
 GOTO RUN_NMAKE_DONE
 :RUN_NMAKE_MISSING
@@ -501,7 +501,8 @@ IF ERRORLEVEL 1 (
 )
 >"%WRAPPER_TOOL_DIR%\nmake.bat" ECHO @ECHO wrapper^>"%OUTPUT_ROOT%\wrapper.marker"
 >"%WRAPPER_TOOL_DIR%\nmake.cmd" ECHO @ECHO wrapper^>"%OUTPUT_ROOT%\wrapper.marker"
->"%BANG_DIR%\colored_print.cmd" ECHO @ECHO helper^>"%OUTPUT_ROOT%\helper.marker"
+>"%WRAPPER_TOOL_DIR%\colored_print.cmd" ECHO @ECHO earlier helper^>"%OUTPUT_ROOT%\earlier-helper.marker"
+>"%BANG_DIR%\colored_print.cmd" ECHO @ECHO current helper^>"%OUTPUT_ROOT%\helper.marker"
 >>"%BANG_DIR%\colored_print.cmd" ECHO @ECHO trusted^>"%OUTPUT_ROOT%\trusted-nmake.marker"
 SET "PATH=%WRAPPER_TOOL_DIR%;%TRUSTED_TOOL_DIR%;%PATH%"
 CALL :RUN CD /D "%BANG_DIR%"
@@ -525,6 +526,10 @@ IF NOT EXIST "%OUTPUT_ROOT%\helper.marker" (
   SET "RUN_RC=102"
   GOTO SELF_TEST_DONE
 )
+IF EXIST "%OUTPUT_ROOT%\earlier-helper.marker" (
+  SET "RUN_RC=117"
+  GOTO SELF_TEST_DONE
+)
 SET "PATH=%WRAPPER_TOOL_DIR%"
 CALL :RUN_NMAKE /d /c colored_print
 IF NOT "%RUN_RC%"=="104" (
@@ -542,7 +547,7 @@ IF NOT "%RUN_RC%"=="104" (
   GOTO SELF_TEST_DONE
 )
 SET "PATH=%PATH_BEFORE_NMAKE%"
-"%POWERSHELL_EXE%" -NoProfile -Command "$lines=[IO.File]::ReadAllLines($env:COMMAND_LOG); $logs=@($lines|%%{($_ -split '\|')[5]}|Select-Object -Unique); if($lines.Count -ne 5 -or $logs.Count -ne 5 -or -not (($lines -join [Environment]::NewLine).Contains($env:BANG_DIR))){exit 1}"
+"%POWERSHELL_EXE%" -NoProfile -Command "$lines=[IO.File]::ReadAllLines($env:COMMAND_LOG); $logs=@($lines|%%{($_ -split '\|')[5]}|Select-Object -Unique); $command=($lines[-1] -split '\|',7)[6]; $expected=[char]34+[IO.Path]::Combine($env:TRUSTED_TOOL_DIR,'nmake.exe')+[char]34; if($lines.Count -ne 5 -or $logs.Count -ne 5 -or -not (($lines -join [Environment]::NewLine).Contains($env:BANG_DIR)) -or -not $command.StartsWith($expected,[StringComparison]::OrdinalIgnoreCase)){exit 1}"
 IF ERRORLEVEL 1 (
   SET "RUN_RC=91"
   GOTO SELF_TEST_DONE
