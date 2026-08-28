@@ -82,6 +82,21 @@ function Get-FullPath {
     return [System.IO.Path]::GetFullPath($Path)
 }
 
+function Remove-TestDirectoryReparsePoint {
+    param([string]$Path, [string]$ExpectedParent)
+
+    $fullPath = Get-FullPath $Path
+    $fullExpectedParent = (Get-FullPath $ExpectedParent).TrimEnd('\')
+    Assert-Condition ([string]::Equals((Split-Path -Parent $fullPath).TrimEnd('\'), $fullExpectedParent, [StringComparison]::OrdinalIgnoreCase)) "Refusing to remove a reparse fixture outside its expected parent: $fullPath"
+
+    $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction SilentlyContinue
+    Assert-Condition ($null -ne $item -and $item.PSIsContainer) "Directory reparse fixture is missing: $fullPath"
+    Assert-Condition ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) "Refusing to remove a non-reparse fixture: $fullPath"
+
+    [IO.Directory]::Delete($fullPath, $false)
+    Assert-Condition ($null -eq (Get-Item -LiteralPath $fullPath -Force -ErrorAction SilentlyContinue)) "Unable to remove directory reparse fixture: $fullPath"
+}
+
 function Get-FileDigest {
     param([string]$Path, [ValidateSet('SHA256', 'SHA512')][string]$Algorithm)
     $hasher = [Security.Cryptography.HashAlgorithm]::Create($Algorithm)
@@ -184,11 +199,29 @@ function Assert-TreeMatches {
         [string]$CandidateRoot,
         [string[]]$AllowedCandidatePrefixes = @()
     )
-    Assert-Condition (Test-Path -LiteralPath $ReferenceRoot -PathType Container) "Reference tree is missing: $ReferenceRoot"
-    Assert-Condition (Test-Path -LiteralPath $CandidateRoot -PathType Container) "Candidate tree is missing: $CandidateRoot"
+    function Get-TreeFilesFailClosed {
+        param([string]$Root, [string]$TreeName)
+
+        $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction SilentlyContinue
+        Assert-Condition ($null -ne $rootItem -and $rootItem.PSIsContainer) "$TreeName tree is missing: $Root"
+        Assert-Condition (-not ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) "$TreeName tree contains a reparse point: $($rootItem.FullName)"
+
+        $pending = New-Object 'Collections.Generic.Stack[string]'
+        $pending.Push($rootItem.FullName)
+        while ($pending.Count -gt 0) {
+            foreach ($item in Get-ChildItem -LiteralPath $pending.Pop() -Force) {
+                Assert-Condition (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) "$TreeName tree contains a reparse point: $($item.FullName)"
+                if ($item.PSIsContainer) {
+                    $pending.Push($item.FullName)
+                } else {
+                    $item
+                }
+            }
+        }
+    }
+
     $referenceFiles = @{}
-    foreach ($file in Get-ChildItem -LiteralPath $ReferenceRoot -File -Recurse -Force) {
-        Assert-Condition (-not ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) "Reference tree contains a reparse point: $($file.FullName)"
+    foreach ($file in Get-TreeFilesFailClosed $ReferenceRoot 'Reference') {
         $relative = $file.FullName.Substring($ReferenceRoot.TrimEnd('\').Length + 1)
         $referenceFiles[$relative.ToLowerInvariant()] = [ordered]@{
             path = $relative
@@ -196,8 +229,7 @@ function Assert-TreeMatches {
         }
     }
     $candidateFiles = @{}
-    foreach ($file in Get-ChildItem -LiteralPath $CandidateRoot -File -Recurse -Force) {
-        Assert-Condition (-not ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) "Candidate tree contains a reparse point: $($file.FullName)"
+    foreach ($file in Get-TreeFilesFailClosed $CandidateRoot 'Candidate') {
         $relative = $file.FullName.Substring($CandidateRoot.TrimEnd('\').Length + 1)
         $candidateFiles[$relative.ToLowerInvariant()] = [ordered]@{
             path = $relative
@@ -694,6 +726,48 @@ function Invoke-SelfTest {
         $sourceRecord = Get-SourceRecord 'fixture' $metadata $source $overlay $work
         Assert-Condition ($sourceRecord.version -eq '1.0') 'Source identity positive test failed.'
         Assert-Condition ($sourceRecord.extractedFileCount -eq 2 -and $sourceRecord.appliedOverlayFileCount -eq 1) 'Source tree binding positive test failed.'
+
+        $externalTree = Join-Path $work 'external-tree'
+        New-Item -ItemType Directory -Path $externalTree | Out-Null
+        Set-Content -LiteralPath (Join-Path $externalTree 'external.c') -Value 'int unlocked_external_source;'
+        foreach ($linkType in @('Junction', 'SymbolicLink')) {
+            $candidateLink = Join-Path $source "external-$($linkType.ToLowerInvariant())"
+            try {
+                New-Item -ItemType $linkType -Path $candidateLink -Target $externalTree -ErrorAction Stop | Out-Null
+            } catch {
+                if ($linkType -eq 'SymbolicLink') { continue }
+                throw
+            }
+            try {
+                $failureMessage = ''
+                try {
+                    Assert-TreeMatches $lockedSource $source @('win64') | Out-Null
+                } catch {
+                    $failureMessage = $_.Exception.Message
+                }
+                Assert-Condition (-not [string]::IsNullOrWhiteSpace($failureMessage)) "Self-test 'candidate-directory-$($linkType.ToLowerInvariant())' did not fail closed."
+                Assert-Condition ($failureMessage.Contains($candidateLink)) "Candidate directory $linkType failure did not identify the offending path."
+            } finally {
+                Remove-TestDirectoryReparsePoint $candidateLink $source
+            }
+            Assert-Condition (Test-Path -LiteralPath (Join-Path $externalTree 'external.c') -PathType Leaf) "Candidate directory $linkType cleanup removed the external target."
+
+            $referenceLink = Join-Path $lockedSource "external-$($linkType.ToLowerInvariant())"
+            New-Item -ItemType $linkType -Path $referenceLink -Target $externalTree -ErrorAction Stop | Out-Null
+            try {
+                $failureMessage = ''
+                try {
+                    Assert-TreeMatches $lockedSource $source @('win64') | Out-Null
+                } catch {
+                    $failureMessage = $_.Exception.Message
+                }
+                Assert-Condition (-not [string]::IsNullOrWhiteSpace($failureMessage)) "Self-test 'reference-directory-$($linkType.ToLowerInvariant())' did not fail closed."
+                Assert-Condition ($failureMessage.Contains($referenceLink)) "Reference directory $linkType failure did not identify the offending path."
+            } finally {
+                Remove-TestDirectoryReparsePoint $referenceLink $lockedSource
+            }
+            Assert-Condition (Test-Path -LiteralPath (Join-Path $externalTree 'external.c') -PathType Leaf) "Reference directory $linkType cleanup removed the external target."
+        }
 
         $overlayRepository = Join-Path $work 'overlay-repository'
         $gmpOverlayRoot = Join-Path $overlayRepository 'libgmp\win64'
