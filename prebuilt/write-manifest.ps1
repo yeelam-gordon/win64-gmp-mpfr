@@ -165,78 +165,67 @@ function Get-TreeFilesFailClosed {
     }
 }
 
-function Resolve-TarApplicationPath {
-    param($Command)
+function Resolve-TrustedApplicationPath {
+    param(
+        [ValidateSet('tar.exe', 'git.exe', 'cl.exe', 'link.exe', 'lib.exe', 'nmake.exe', 'armasm64.exe', 'ml64.exe')]
+        [string]$ExpectedName,
+        $Command
+    )
 
-    if ($null -eq $Command) {
-        $Command = Get-Command tar.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1
-    }
-    Assert-Condition ($null -ne $Command) 'tar.exe application is not available.'
-
+    Assert-Condition ($null -ne $Command) "$ExpectedName application is not available."
     $commandType = $Command.PSObject.Properties['CommandType']
     $commandName = $Command.PSObject.Properties['Name']
     $commandSource = $Command.PSObject.Properties['Source']
-    Assert-Condition ($null -ne $commandType -and ([string]$commandType.Value) -ceq 'Application') 'tar.exe must resolve to a PowerShell Application.'
-    Assert-Condition ($null -ne $commandName -and ([string]$commandName.Value) -ieq 'tar.exe') 'Resolved tar application name must be tar.exe.'
-    Assert-Condition ($null -ne $commandSource -and $commandSource.Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$commandSource.Value)) 'Resolved tar application has no source path.'
+    Assert-Condition ($null -ne $commandType -and ([string]$commandType.Value) -ceq 'Application') "$ExpectedName must resolve to a PowerShell Application."
+    Assert-Condition ($null -ne $commandName -and ([string]$commandName.Value) -ieq $ExpectedName) "Resolved application name must be $ExpectedName."
+    Assert-Condition ($null -ne $commandSource -and $commandSource.Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$commandSource.Value)) "Resolved $ExpectedName application has no source path."
 
     $sourcePath = [string]$commandSource.Value
-    Assert-Condition ([IO.Path]::IsPathRooted($sourcePath)) "Resolved tar application path is not absolute: $sourcePath"
+    Assert-Condition ([IO.Path]::IsPathRooted($sourcePath)) "Resolved $ExpectedName application path is not absolute: $sourcePath"
     $fullSourcePath = Get-FullPath $sourcePath
-    Assert-Condition ((Split-Path -Leaf $fullSourcePath) -ieq 'tar.exe') "Resolved tar application filename is not tar.exe: $fullSourcePath"
+    Assert-Condition ((Split-Path -Leaf $fullSourcePath) -ieq $ExpectedName) "Resolved application filename is not ${ExpectedName}: $fullSourcePath"
     $item = Get-Item -LiteralPath $fullSourcePath -Force -ErrorAction SilentlyContinue
-    Assert-Condition ($null -ne $item -and -not $item.PSIsContainer) "Resolved tar application is not an existing file: $fullSourcePath"
-    Assert-Condition (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) "Resolved tar application is a reparse point: $fullSourcePath"
-    Assert-Condition ([IO.Path]::IsPathRooted($item.FullName) -and ([IO.Path]::GetExtension($item.FullName)) -ieq '.exe') "Resolved tar application is not an absolute .exe path: $($item.FullName)"
-    Assert-Condition ((Split-Path -Leaf $item.FullName) -ieq 'tar.exe') "Resolved tar application filename is not tar.exe: $($item.FullName)"
+    Assert-Condition ($null -ne $item -and -not $item.PSIsContainer) "Resolved $ExpectedName application is not an existing file: $fullSourcePath"
+    Assert-Condition ([IO.Path]::IsPathRooted($item.FullName) -and ([IO.Path]::GetExtension($item.FullName)) -ieq '.exe') "Resolved $ExpectedName application is not an absolute .exe path: $($item.FullName)"
+    Assert-Condition ((Split-Path -Leaf $item.FullName) -ieq $ExpectedName) "Resolved application filename is not ${ExpectedName}: $($item.FullName)"
+    Assert-Condition ([string]::Equals($fullSourcePath, $item.FullName, [StringComparison]::OrdinalIgnoreCase)) "Resolved $ExpectedName application path is not canonical."
+
+    $pathToCheck = $item.FullName
+    while (-not [string]::IsNullOrWhiteSpace($pathToCheck)) {
+        $pathItem = Get-Item -LiteralPath $pathToCheck -Force -ErrorAction SilentlyContinue
+        Assert-Condition ($null -ne $pathItem) "Resolved $ExpectedName application path component does not exist: $pathToCheck"
+        Assert-Condition (-not ($pathItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) "Resolved $ExpectedName application path contains a reparse point: $pathToCheck"
+        $parentPath = Split-Path -Parent $pathToCheck
+        if ([string]::Equals($parentPath, $pathToCheck, [StringComparison]::OrdinalIgnoreCase)) { break }
+        $pathToCheck = $parentPath
+    }
 
     foreach ($propertyName in @('Path', 'Definition')) {
         $property = $Command.PSObject.Properties[$propertyName]
         if ($null -eq $property) { continue }
-        Assert-Condition ($property.Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) "Resolved tar application has invalid $propertyName metadata."
+        Assert-Condition ($property.Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) "Resolved $ExpectedName application has invalid $propertyName metadata."
         $metadataPath = [string]$property.Value
-        Assert-Condition ([IO.Path]::IsPathRooted($metadataPath)) "Resolved tar application $propertyName path is not absolute: $metadataPath"
-        Assert-Condition ([string]::Equals((Get-FullPath $metadataPath), $item.FullName, [StringComparison]::OrdinalIgnoreCase)) "Resolved tar application metadata paths disagree."
+        Assert-Condition ([IO.Path]::IsPathRooted($metadataPath)) "Resolved $ExpectedName application $propertyName path is not absolute: $metadataPath"
+        Assert-Condition ([string]::Equals((Get-FullPath $metadataPath), $item.FullName, [StringComparison]::OrdinalIgnoreCase)) "Resolved $ExpectedName application metadata paths disagree."
     }
 
     return $item.FullName
 }
 
+function Resolve-TarApplicationPath {
+    param($Command)
+    if ($null -eq $Command) {
+        $Command = Get-Command tar.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    }
+    return Resolve-TrustedApplicationPath 'tar.exe' $Command
+}
+
 function Resolve-GitApplicationPath {
     param($Command)
-
     if ($null -eq $Command) {
         $Command = Get-Command git.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1
     }
-    Assert-Condition ($null -ne $Command) 'git.exe application is not available.'
-
-    $commandType = $Command.PSObject.Properties['CommandType']
-    $commandName = $Command.PSObject.Properties['Name']
-    $commandSource = $Command.PSObject.Properties['Source']
-    Assert-Condition ($null -ne $commandType -and ([string]$commandType.Value) -ceq 'Application') 'git.exe must resolve to a PowerShell Application.'
-    Assert-Condition ($null -ne $commandName -and ([string]$commandName.Value) -ieq 'git.exe') 'Resolved Git application name must be git.exe.'
-    Assert-Condition ($null -ne $commandSource -and $commandSource.Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$commandSource.Value)) 'Resolved Git application has no source path.'
-
-    $sourcePath = [string]$commandSource.Value
-    Assert-Condition ([IO.Path]::IsPathRooted($sourcePath)) "Resolved Git application path is not absolute: $sourcePath"
-    $fullSourcePath = Get-FullPath $sourcePath
-    Assert-Condition ((Split-Path -Leaf $fullSourcePath) -ieq 'git.exe') "Resolved Git application filename is not git.exe: $fullSourcePath"
-    $item = Get-Item -LiteralPath $fullSourcePath -Force -ErrorAction SilentlyContinue
-    Assert-Condition ($null -ne $item -and -not $item.PSIsContainer) "Resolved Git application is not an existing file: $fullSourcePath"
-    Assert-Condition (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) "Resolved Git application is a reparse point: $fullSourcePath"
-    Assert-Condition ([IO.Path]::IsPathRooted($item.FullName) -and ([IO.Path]::GetExtension($item.FullName)) -ieq '.exe') "Resolved Git application is not an absolute .exe path: $($item.FullName)"
-    Assert-Condition ((Split-Path -Leaf $item.FullName) -ieq 'git.exe') "Resolved Git application filename is not git.exe: $($item.FullName)"
-
-    foreach ($propertyName in @('Path', 'Definition')) {
-        $property = $Command.PSObject.Properties[$propertyName]
-        if ($null -eq $property) { continue }
-        Assert-Condition ($property.Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) "Resolved Git application has invalid $propertyName metadata."
-        $metadataPath = [string]$property.Value
-        Assert-Condition ([IO.Path]::IsPathRooted($metadataPath)) "Resolved Git application $propertyName path is not absolute: $metadataPath"
-        Assert-Condition ([string]::Equals((Get-FullPath $metadataPath), $item.FullName, [StringComparison]::OrdinalIgnoreCase)) "Resolved Git application metadata paths disagree."
-    }
-
-    return $item.FullName
+    return Resolve-TrustedApplicationPath 'git.exe' $Command
 }
 
 function Assert-ArchiveMembersSafe {
@@ -517,19 +506,22 @@ function Get-OverlayRecord {
 }
 
 function Get-ToolRecord {
-    param([string]$Name, [bool]$Required)
-    $command = Get-Command $Name -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $command) {
+    param([string]$Name, [bool]$Required, $Command)
+    if ($null -eq $Command) {
+        $Command = Get-Command $Name -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    if ($null -eq $Command) {
         Assert-Condition (-not $Required) "Required build tool is not available: $Name"
         return $null
     }
+    $applicationPath = Resolve-TrustedApplicationPath $Name $Command
     $text = ''
     try {
-        $text = ((& $command.Source 2>&1 | Select-Object -First 8) -join "`n").Trim()
+        $text = ((& $applicationPath 2>&1 | Select-Object -First 8) -join "`n").Trim()
     } catch {
         $text = $_.Exception.Message
     }
-    [ordered]@{ name = $Name; path = $command.Source; version = $text }
+    [ordered]@{ name = $Name; path = $applicationPath; version = $text }
 }
 
 function Get-MachineFromBytes {
@@ -883,6 +875,75 @@ function Invoke-SelfTest {
         Assert-Condition ((Get-ExecutionLimitation 'x64' 'ARM64' $false) -ceq 'Target architecture x64 differs from host/native architecture ARM64; native runtime tests were not run.') 'x64 non-native limitation text is inaccurate.'
         Assert-Condition ((Get-ExecutionLimitation 'arm64' 'AMD64' $false) -ceq 'Target architecture arm64 differs from host/native architecture AMD64; native runtime tests were not run.') 'Arm64 non-native limitation text is inaccurate.'
         Assert-Condition ((Get-ExecutionLimitation 'x64' 'AMD64' $true) -ceq 'Native tests were run by the selected Makefile check target.') 'Native limitation text changed unexpectedly.'
+
+        $toolDirectory = Join-Path $work 'tool-record'
+        New-Item -ItemType Directory -Path $toolDirectory | Out-Null
+        $toolPath = Join-Path $toolDirectory 'cl.exe'
+        Copy-Item -LiteralPath (Get-Command whoami.exe -CommandType Application -ErrorAction Stop).Source -Destination $toolPath
+        $toolCommand = Get-Command $toolPath -CommandType Application -ErrorAction Stop
+        $expectedToolVersion = ((& $toolPath 2>&1 | Select-Object -First 8) -join "`n").Trim()
+        $toolRecord = Get-ToolRecord 'cl.exe' $true $toolCommand
+        Assert-Condition ($toolRecord.name -ceq 'cl.exe') 'Tool record positive test changed the requested name.'
+        Assert-Condition ([string]::Equals($toolRecord.path, $toolPath, [StringComparison]::OrdinalIgnoreCase)) 'Tool record positive test did not preserve the canonical validated path.'
+        Assert-Condition ($toolRecord.version -ceq $expectedToolVersion) 'Tool record positive test did not execute the validated application path.'
+
+        Set-Alias -Name 'link.exe' -Value Get-Date -Scope Local
+        try {
+            Invoke-ExpectedFailure { Get-ToolRecord 'link.exe' $true (Get-Command 'link.exe' -ErrorAction Stop) } 'tool-alias-spoof' 'PowerShell Application'
+        } finally {
+            Remove-Item -LiteralPath Alias:link.exe -Force
+        }
+        Set-Item -LiteralPath Function:lib.exe -Value { 'spoofed function' }
+        try {
+            Invoke-ExpectedFailure { Get-ToolRecord 'lib.exe' $true (Get-Command 'lib.exe' -ErrorAction Stop) } 'tool-function-spoof' 'PowerShell Application'
+        } finally {
+            Remove-Item -LiteralPath Function:lib.exe -Force
+        }
+
+        $spoofedToolCommand = [pscustomobject]@{
+            CommandType = 'Application'
+            Name = 'cl.exe'
+            Source = $toolPath
+            Path = (Join-Path $toolDirectory 'spoofed-cl.exe')
+            Definition = $toolPath
+        }
+        Invoke-ExpectedFailure { Get-ToolRecord 'cl.exe' $true $spoofedToolCommand } 'tool-metadata-spoof' 'metadata paths disagree'
+        $scriptToolCommand = [pscustomobject]@{
+            CommandType = 'ExternalScript'
+            Name = 'cl.exe'
+            Source = $toolPath
+            Path = $toolPath
+            Definition = $toolPath
+        }
+        Invoke-ExpectedFailure { Get-ToolRecord 'cl.exe' $true $scriptToolCommand } 'tool-script-spoof' 'PowerShell Application'
+        $directoryToolPath = Join-Path $toolDirectory 'nmake.exe'
+        New-Item -ItemType Directory -Path $directoryToolPath | Out-Null
+        $directoryToolCommand = [pscustomobject]@{
+            CommandType = 'Application'
+            Name = 'nmake.exe'
+            Source = $directoryToolPath
+            Path = $directoryToolPath
+            Definition = $directoryToolPath
+        }
+        Invoke-ExpectedFailure { Get-ToolRecord 'nmake.exe' $true $directoryToolCommand } 'tool-directory-spoof' 'not an existing file'
+        $mismatchedToolCommand = [pscustomobject]@{
+            CommandType = 'Application'
+            Name = 'link.exe'
+            Source = $toolPath
+            Path = $toolPath
+            Definition = $toolPath
+        }
+        Invoke-ExpectedFailure { Get-ToolRecord 'cl.exe' $true $mismatchedToolCommand } 'tool-name-spoof' 'application name must be cl.exe'
+
+        $toolJunction = Join-Path $work 'tool-record-junction'
+        New-Item -ItemType Junction -Path $toolJunction -Target $toolDirectory -ErrorAction Stop | Out-Null
+        try {
+            $reparseToolPath = Join-Path $toolJunction 'cl.exe'
+            $reparseToolCommand = Get-Command $reparseToolPath -CommandType Application -ErrorAction Stop
+            Invoke-ExpectedFailure { Get-ToolRecord 'cl.exe' $true $reparseToolCommand } 'tool-reparse-spoof' 'contains a reparse point'
+        } finally {
+            Remove-TestDirectoryReparsePoint $toolJunction $work
+        }
 
         $diagnosticException = New-Object ApplicationException(
             "outer diagnostic failure`nwith detail",
