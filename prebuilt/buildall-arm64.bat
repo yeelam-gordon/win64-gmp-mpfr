@@ -396,17 +396,17 @@ ENDLOCAL & EXIT /B 0
 SETLOCAL DisableDelayedExpansion
 SET "NMAKE_EXE="
 FOR %%I IN (nmake.exe) DO SET "NMAKE_EXE=%%~$PATH:I"
-IF NOT DEFINED NMAKE_EXE (
-  ECHO ERROR: trusted nmake.exe was not found on PATH.
-  SET "RC=69"
-  SET "RUN_CWD=%CD%"
-  GOTO RUN_NMAKE_DONE
-)
+IF NOT DEFINED NMAKE_EXE GOTO RUN_NMAKE_MISSING
+FOR %%I IN ("%NMAKE_EXE%") DO IF /I NOT "%%~fI"=="%NMAKE_EXE%" GOTO RUN_NMAKE_MISSING
 SET "PATH=%PATH%;%CD%"
 CALL :RUN "%NMAKE_EXE%" %*
+GOTO RUN_NMAKE_DONE
+:RUN_NMAKE_MISSING
+ECHO ERROR: trusted nmake.exe was not found as an absolute path on PATH.
+SET "RUN_RC=69"
+:RUN_NMAKE_DONE
 SET "RC=%RUN_RC%"
 SET "RUN_CWD=%CD%"
-:RUN_NMAKE_DONE
 ENDLOCAL & CD /D "%RUN_CWD%" >NUL & SET "COMMAND_INDEX=%COMMAND_INDEX%" & SET "RUN_RC=%RC%" & SET "RUN_ACTION=" & SET "RUN_LIBRARY=" & EXIT /B %RC%
 
 :RUN
@@ -481,6 +481,19 @@ IF ERRORLEVEL 1 (
   SET "RUN_RC=98"
   GOTO SELF_TEST_DONE
 )
+SET "PATH_BEFORE_RELATIVE_NMAKE=%PATH%"
+SET "PATH=..\..\trusted tools"
+CALL :RUN_NMAKE /D /C "ECHO relative-path>relative-nmake.marker"
+SET "RELATIVE_NMAKE_RC=%RUN_RC%"
+SET "PATH=%PATH_BEFORE_RELATIVE_NMAKE%"
+IF NOT "%RELATIVE_NMAKE_RC%"=="0" (
+  SET "RUN_RC=106"
+  GOTO SELF_TEST_DONE
+)
+IF NOT EXIST "%TEST_BUILD_DIR%\relative-nmake.marker" (
+  SET "RUN_RC=107"
+  GOTO SELF_TEST_DONE
+)
 SET "PATH_BEFORE_MISSING_NMAKE=%PATH%"
 SET "PATH=%OUTPUT_ROOT%"
 CALL :RUN_NMAKE /D /C "ECHO spoof-ran>missing-nmake-spoof.marker"
@@ -495,7 +508,7 @@ IF EXIST "%TEST_BUILD_DIR%\missing-nmake-spoof.marker" (
   GOTO SELF_TEST_DONE
 )
 SET "RUN_RC=0"
-"%POWERSHELL_EXE%" -NoProfile -Command "$lines=[IO.File]::ReadAllLines($env:COMMAND_LOG); $logs=@($lines|%%{($_ -split '\|')[5]}|Select-Object -Unique); if($lines.Count -ne 5 -or $logs.Count -ne 5 -or -not (($lines -join [Environment]::NewLine).Contains($env:BANG_DIR))){exit 1}"
+"%POWERSHELL_EXE%" -NoProfile -Command "$lines=[IO.File]::ReadAllLines($env:COMMAND_LOG); $logs=@($lines|%%{($_ -split '\|')[5]}|Select-Object -Unique); if($lines.Count -ne 6 -or $logs.Count -ne 6 -or -not (($lines -join [Environment]::NewLine).Contains($env:BANG_DIR))){exit 1}"
 IF ERRORLEVEL 1 (
   SET "RUN_RC=91"
   GOTO SELF_TEST_DONE
