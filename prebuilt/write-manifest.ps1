@@ -165,6 +165,80 @@ function Get-TreeFilesFailClosed {
     }
 }
 
+function Resolve-TarApplicationPath {
+    param($Command)
+
+    if ($null -eq $Command) {
+        $Command = Get-Command tar.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    }
+    Assert-Condition ($null -ne $Command) 'tar.exe application is not available.'
+
+    $commandType = $Command.PSObject.Properties['CommandType']
+    $commandName = $Command.PSObject.Properties['Name']
+    $commandSource = $Command.PSObject.Properties['Source']
+    Assert-Condition ($null -ne $commandType -and ([string]$commandType.Value) -ceq 'Application') 'tar.exe must resolve to a PowerShell Application.'
+    Assert-Condition ($null -ne $commandName -and ([string]$commandName.Value) -ieq 'tar.exe') 'Resolved tar application name must be tar.exe.'
+    Assert-Condition ($null -ne $commandSource -and $commandSource.Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$commandSource.Value)) 'Resolved tar application has no source path.'
+
+    $sourcePath = [string]$commandSource.Value
+    Assert-Condition ([IO.Path]::IsPathRooted($sourcePath)) "Resolved tar application path is not absolute: $sourcePath"
+    $fullSourcePath = Get-FullPath $sourcePath
+    Assert-Condition ((Split-Path -Leaf $fullSourcePath) -ieq 'tar.exe') "Resolved tar application filename is not tar.exe: $fullSourcePath"
+    $item = Get-Item -LiteralPath $fullSourcePath -Force -ErrorAction SilentlyContinue
+    Assert-Condition ($null -ne $item -and -not $item.PSIsContainer) "Resolved tar application is not an existing file: $fullSourcePath"
+    Assert-Condition (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) "Resolved tar application is a reparse point: $fullSourcePath"
+    Assert-Condition ([IO.Path]::IsPathRooted($item.FullName) -and ([IO.Path]::GetExtension($item.FullName)) -ieq '.exe') "Resolved tar application is not an absolute .exe path: $($item.FullName)"
+    Assert-Condition ((Split-Path -Leaf $item.FullName) -ieq 'tar.exe') "Resolved tar application filename is not tar.exe: $($item.FullName)"
+
+    foreach ($propertyName in @('Path', 'Definition')) {
+        $property = $Command.PSObject.Properties[$propertyName]
+        if ($null -eq $property) { continue }
+        Assert-Condition ($property.Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) "Resolved tar application has invalid $propertyName metadata."
+        $metadataPath = [string]$property.Value
+        Assert-Condition ([IO.Path]::IsPathRooted($metadataPath)) "Resolved tar application $propertyName path is not absolute: $metadataPath"
+        Assert-Condition ([string]::Equals((Get-FullPath $metadataPath), $item.FullName, [StringComparison]::OrdinalIgnoreCase)) "Resolved tar application metadata paths disagree."
+    }
+
+    return $item.FullName
+}
+
+function Resolve-GitApplicationPath {
+    param($Command)
+
+    if ($null -eq $Command) {
+        $Command = Get-Command git.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    }
+    Assert-Condition ($null -ne $Command) 'git.exe application is not available.'
+
+    $commandType = $Command.PSObject.Properties['CommandType']
+    $commandName = $Command.PSObject.Properties['Name']
+    $commandSource = $Command.PSObject.Properties['Source']
+    Assert-Condition ($null -ne $commandType -and ([string]$commandType.Value) -ceq 'Application') 'git.exe must resolve to a PowerShell Application.'
+    Assert-Condition ($null -ne $commandName -and ([string]$commandName.Value) -ieq 'git.exe') 'Resolved Git application name must be git.exe.'
+    Assert-Condition ($null -ne $commandSource -and $commandSource.Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$commandSource.Value)) 'Resolved Git application has no source path.'
+
+    $sourcePath = [string]$commandSource.Value
+    Assert-Condition ([IO.Path]::IsPathRooted($sourcePath)) "Resolved Git application path is not absolute: $sourcePath"
+    $fullSourcePath = Get-FullPath $sourcePath
+    Assert-Condition ((Split-Path -Leaf $fullSourcePath) -ieq 'git.exe') "Resolved Git application filename is not git.exe: $fullSourcePath"
+    $item = Get-Item -LiteralPath $fullSourcePath -Force -ErrorAction SilentlyContinue
+    Assert-Condition ($null -ne $item -and -not $item.PSIsContainer) "Resolved Git application is not an existing file: $fullSourcePath"
+    Assert-Condition (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) "Resolved Git application is a reparse point: $fullSourcePath"
+    Assert-Condition ([IO.Path]::IsPathRooted($item.FullName) -and ([IO.Path]::GetExtension($item.FullName)) -ieq '.exe') "Resolved Git application is not an absolute .exe path: $($item.FullName)"
+    Assert-Condition ((Split-Path -Leaf $item.FullName) -ieq 'git.exe') "Resolved Git application filename is not git.exe: $($item.FullName)"
+
+    foreach ($propertyName in @('Path', 'Definition')) {
+        $property = $Command.PSObject.Properties[$propertyName]
+        if ($null -eq $property) { continue }
+        Assert-Condition ($property.Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) "Resolved Git application has invalid $propertyName metadata."
+        $metadataPath = [string]$property.Value
+        Assert-Condition ([IO.Path]::IsPathRooted($metadataPath)) "Resolved Git application $propertyName path is not absolute: $metadataPath"
+        Assert-Condition ([string]::Equals((Get-FullPath $metadataPath), $item.FullName, [StringComparison]::OrdinalIgnoreCase)) "Resolved Git application metadata paths disagree."
+    }
+
+    return $item.FullName
+}
+
 function Assert-ArchiveMembersSafe {
     param([string]$TarPath, [string]$ArchivePath, [string]$ExtractionRoot)
     $startInfo = New-Object Diagnostics.ProcessStartInfo
@@ -210,6 +284,33 @@ function Assert-ArchiveMembersSafe {
             throw "Archive member path is malformed: $member"
         }
         Assert-Condition (Test-PathInside $candidate $ExtractionRoot) "Archive member path escapes extraction root: $member"
+    }
+}
+
+function Expand-ArchiveWithTar {
+    param([string]$TarPath, [string]$ArchivePath, [string]$ExtractionRoot, [string]$Name)
+
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $TarPath
+    $startInfo.Arguments = '-xf "' + $ArchivePath.Replace('"', '\"') + '" -C "' + $ExtractionRoot.Replace('"', '\"') + '"'
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $startInfo
+    try {
+        Assert-Condition $process.Start() "Unable to extract $Name archive: $ArchivePath"
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $stdout = $stdoutTask.Result
+        $stderr = $stderrTask.Result
+        Assert-Condition ($process.ExitCode -eq 0) "$Name archive extraction failed: $stderr"
+        Assert-Condition ([string]::IsNullOrWhiteSpace($stderr)) "$Name archive extraction produced diagnostics: $stderr"
+        Assert-Condition ([string]::IsNullOrWhiteSpace($stdout)) "$Name archive extraction produced unexpected output: $stdout"
+    } finally {
+        $process.Dispose()
     }
 }
 
@@ -352,10 +453,9 @@ function Get-SourceRecord {
     $validation = Join-Path $ValidationRoot ("source-validation-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $validation | Out-Null
     try {
-        $tar = Get-Command tar.exe -ErrorAction Stop
-        Assert-ArchiveMembersSafe $tar.Source $archive $validation
-        & $tar.Source -xf $archive -C $validation
-        Assert-Condition ($LASTEXITCODE -eq 0) "$Name archive extraction failed."
+        $tarPath = Resolve-TarApplicationPath
+        Assert-ArchiveMembersSafe $tarPath $archive $validation
+        Expand-ArchiveWithTar $tarPath $archive $validation $Name
         $lockedSource = Join-Path $validation ([string]$Metadata.extractedDirectory)
         $sourceIdentity = Assert-TreeMatches $lockedSource $source @('win64')
         $overlayIdentity = Assert-TreeMatches $OverlayPath (Join-Path $source 'win64')
@@ -382,11 +482,15 @@ function Get-SourceRecord {
 
 function Get-OverlayRecord {
     param([string]$RepositoryRoot, [bool]$AllowDirty)
-    $git = Get-Command git -ErrorAction Stop
-    $commit = (& $git.Source -C $RepositoryRoot rev-parse HEAD).Trim()
-    Assert-Condition ($LASTEXITCODE -eq 0 -and $commit -match '^[0-9a-f]{40}$') 'Unable to identify overlay Git commit.'
-    $status = @(& $git.Source -C $RepositoryRoot status --porcelain)
-    Assert-Condition ($LASTEXITCODE -eq 0) 'Unable to determine overlay dirty state.'
+    $gitPath = Resolve-GitApplicationPath
+    $commitOutput = @(& $gitPath -C $RepositoryRoot rev-parse HEAD)
+    $commitExitCode = $LASTEXITCODE
+    Assert-Condition ($commitExitCode -eq 0) 'Unable to identify overlay Git commit.'
+    $commit = ($commitOutput -join "`n").Trim()
+    Assert-Condition ($commit -match '^[0-9a-f]{40}$') 'Unable to identify overlay Git commit.'
+    $status = @(& $gitPath -C $RepositoryRoot status --porcelain)
+    $statusExitCode = $LASTEXITCODE
+    Assert-Condition ($statusExitCode -eq 0) 'Unable to determine overlay dirty state.'
     $dirty = $status.Count -gt 0
     Assert-Condition ($AllowDirty -or -not $dirty) 'Overlay repository is dirty; commit the five-file change or pass --allow-dirty-overlay for development evidence.'
 
@@ -876,8 +980,63 @@ function Invoke-SelfTest {
         Set-Content -LiteralPath (Join-Path $overlay 'Makefile') -Value 'locked overlay'
         Copy-Item -LiteralPath (Join-Path $overlay 'Makefile') -Destination (Join-Path $source 'win64')
         $archive = Join-Path $sourceParent 'sample-1.0.tar'
-        $tar = Get-Command tar.exe -ErrorAction Stop
-        & $tar.Source -cf $archive -C $archiveRoot 'sample-1.0'
+        $tarPath = Resolve-TarApplicationPath
+        Assert-Condition ([IO.Path]::IsPathRooted($tarPath) -and (Test-Path -LiteralPath $tarPath -PathType Leaf) -and (Split-Path -Leaf $tarPath) -ieq 'tar.exe') 'Real tar application resolution did not return an absolute existing tar.exe path.'
+        $validTarCommand = [pscustomobject]@{
+            CommandType = 'Application'
+            Name = 'tar.exe'
+            Source = $tarPath
+            Path = $tarPath
+            Definition = $tarPath
+        }
+        Assert-Condition ((Resolve-TarApplicationPath $validTarCommand) -ieq $tarPath) 'Constructed valid tar application metadata was not accepted.'
+        foreach ($invalidType in @('Alias', 'Function', 'ExternalScript')) {
+            $invalidCommand = [pscustomobject]@{
+                CommandType = $invalidType
+                Name = 'tar.exe'
+                Source = $tarPath
+                Path = $tarPath
+                Definition = $tarPath
+            }
+            Invoke-ExpectedFailure { Resolve-TarApplicationPath $invalidCommand } "tar-command-type-$invalidType"
+        }
+        $relativeTarCommand = [pscustomobject]@{
+            CommandType = 'Application'
+            Name = 'tar.exe'
+            Source = 'tar.exe'
+            Path = 'tar.exe'
+            Definition = 'tar.exe'
+        }
+        Invoke-ExpectedFailure { Resolve-TarApplicationPath $relativeTarCommand } 'tar-relative-path'
+        $directoryTarPath = Join-Path $work 'directory\tar.exe'
+        New-Item -ItemType Directory -Path $directoryTarPath | Out-Null
+        $directoryTarCommand = [pscustomobject]@{
+            CommandType = 'Application'
+            Name = 'tar.exe'
+            Source = $directoryTarPath
+            Path = $directoryTarPath
+            Definition = $directoryTarPath
+        }
+        Invoke-ExpectedFailure { Resolve-TarApplicationPath $directoryTarCommand } 'tar-non-leaf'
+        $wrongNamePath = Join-Path $work 'not-tar.exe'
+        [IO.File]::WriteAllBytes($wrongNamePath, (New-Object byte[] 1))
+        $wrongNameCommand = [pscustomobject]@{
+            CommandType = 'Application'
+            Name = 'tar.exe'
+            Source = $wrongNamePath
+            Path = $wrongNamePath
+            Definition = $wrongNamePath
+        }
+        Invoke-ExpectedFailure { Resolve-TarApplicationPath $wrongNameCommand } 'tar-filename-mismatch'
+        $spoofedTarCommand = [pscustomobject]@{
+            CommandType = 'Application'
+            Name = 'tar.exe'
+            Source = $tarPath
+            Path = $wrongNamePath
+            Definition = $tarPath
+        }
+        Invoke-ExpectedFailure { Resolve-TarApplicationPath $spoofedTarCommand } 'tar-metadata-spoof'
+        & $tarPath -cf $archive -C $archiveRoot 'sample-1.0'
         Assert-Condition ($LASTEXITCODE -eq 0) 'Unable to create source-binding self-test archive.'
         $metadata = [pscustomobject]@{
             version = '1.0'
@@ -942,12 +1101,75 @@ function Invoke-SelfTest {
         New-Item -ItemType Directory -Path $gmpOverlayRoot, $mpfrOverlayRoot | Out-Null
         Set-Content -LiteralPath (Join-Path $gmpOverlayRoot 'Makefile') -Value 'gmp overlay'
         Set-Content -LiteralPath (Join-Path $mpfrOverlayRoot 'Makefile') -Value 'mpfr overlay'
-        $git = Get-Command git -ErrorAction Stop
-        & $git.Source -C $overlayRepository init --quiet
+        $gitPath = Resolve-GitApplicationPath
+        Assert-Condition ([IO.Path]::IsPathRooted($gitPath) -and (Test-Path -LiteralPath $gitPath -PathType Leaf) -and (Split-Path -Leaf $gitPath) -ieq 'git.exe') 'Real Git application resolution did not return an absolute existing git.exe path.'
+        $validGitCommand = [pscustomobject]@{
+            CommandType = 'Application'
+            Name = 'git.exe'
+            Source = $gitPath
+            Path = $gitPath
+            Definition = $gitPath
+        }
+        Assert-Condition ((Resolve-GitApplicationPath $validGitCommand) -ieq $gitPath) 'Constructed valid Git application metadata was not accepted.'
+        foreach ($invalidType in @('Alias', 'Function', 'ExternalScript', 'Script')) {
+            $invalidCommand = [pscustomobject]@{
+                CommandType = $invalidType
+                Name = 'git.exe'
+                Source = $gitPath
+                Path = $gitPath
+                Definition = $gitPath
+            }
+            Invoke-ExpectedFailure { Resolve-GitApplicationPath $invalidCommand } "git-command-type-$invalidType"
+        }
+        $relativeGitCommand = [pscustomobject]@{
+            CommandType = 'Application'
+            Name = 'git.exe'
+            Source = 'git.exe'
+            Path = 'git.exe'
+            Definition = 'git.exe'
+        }
+        Invoke-ExpectedFailure { Resolve-GitApplicationPath $relativeGitCommand } 'git-relative-path'
+        $directoryGitPath = Join-Path $work 'directory\git.exe'
+        New-Item -ItemType Directory -Path $directoryGitPath | Out-Null
+        $directoryGitCommand = [pscustomobject]@{
+            CommandType = 'Application'
+            Name = 'git.exe'
+            Source = $directoryGitPath
+            Path = $directoryGitPath
+            Definition = $directoryGitPath
+        }
+        Invoke-ExpectedFailure { Resolve-GitApplicationPath $directoryGitCommand } 'git-non-leaf'
+        $wrongGitNamePath = Join-Path $work 'not-git.exe'
+        [IO.File]::WriteAllBytes($wrongGitNamePath, (New-Object byte[] 1))
+        $wrongGitNameCommand = [pscustomobject]@{
+            CommandType = 'Application'
+            Name = 'git.exe'
+            Source = $wrongGitNamePath
+            Path = $wrongGitNamePath
+            Definition = $wrongGitNamePath
+        }
+        Invoke-ExpectedFailure { Resolve-GitApplicationPath $wrongGitNameCommand } 'git-filename-mismatch'
+        $wrongGitCommandName = [pscustomobject]@{
+            CommandType = 'Application'
+            Name = 'not-git.exe'
+            Source = $gitPath
+            Path = $gitPath
+            Definition = $gitPath
+        }
+        Invoke-ExpectedFailure { Resolve-GitApplicationPath $wrongGitCommandName } 'git-command-name-mismatch'
+        $spoofedGitCommand = [pscustomobject]@{
+            CommandType = 'Application'
+            Name = 'git.exe'
+            Source = $gitPath
+            Path = $wrongGitNamePath
+            Definition = $gitPath
+        }
+        Invoke-ExpectedFailure { Resolve-GitApplicationPath $spoofedGitCommand } 'git-metadata-spoof'
+        & $gitPath -C $overlayRepository init --quiet
         Assert-Condition ($LASTEXITCODE -eq 0) 'Unable to initialize overlay-root self-test repository.'
-        & $git.Source -C $overlayRepository add .
+        & $gitPath -C $overlayRepository add .
         Assert-Condition ($LASTEXITCODE -eq 0) 'Unable to stage overlay-root self-test files.'
-        & $git.Source -C $overlayRepository -c user.name=write-manifest-self-test -c user.email=self-test@example.invalid commit --quiet -m 'overlay fixtures'
+        & $gitPath -C $overlayRepository -c user.name=write-manifest-self-test -c user.email=self-test@example.invalid commit --quiet -m 'overlay fixtures'
         Assert-Condition ($LASTEXITCODE -eq 0) 'Unable to commit overlay-root self-test files.'
         foreach ($missingOverlay in @(
             [ordered]@{ name = 'GMP'; path = $gmpOverlayRoot; relativePath = 'libgmp\win64' },
@@ -1061,7 +1283,7 @@ function Invoke-SelfTest {
         foreach ($maliciousMember in $maliciousMembers) {
             $maliciousArchive = Join-Path $sourceParent ('malicious-' + [guid]::NewGuid().ToString('N') + '.tar')
             New-TestTarArchive $maliciousArchive $maliciousMember 'must not be extracted'
-            Invoke-ExpectedFailure { Assert-ArchiveMembersSafe $tar.Source $maliciousArchive $work } "unsafe-archive-member-$maliciousMember"
+            Invoke-ExpectedFailure { Assert-ArchiveMembersSafe $tarPath $maliciousArchive $work } "unsafe-archive-member-$maliciousMember"
         }
         $escapePath = Join-Path $work 'archive-escape.txt'
         $traversalArchive = Join-Path $sourceParent 'malicious-traversal.tar'
