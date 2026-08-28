@@ -22,6 +22,8 @@ SET "RUN_RC=0"
 SET "GMP_ALIAS_CREATED="
 SET "GMP_ALIAS_DRIVE="
 SET "MPFR_GMP_SOURCE=%GMP_SOURCE%"
+SET "NATIVE_OS_ARCH="
+SET "TEST_TARGET="
 
 FOR /F %%I IN ('powershell -NoProfile -Command "[DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')"') DO SET "RUN_ID=x64-%%I"
 FOR /F %%I IN ('powershell -NoProfile -Command "[DateTime]::UtcNow.ToString('o')"') DO SET "RUN_START=%%I"
@@ -65,6 +67,9 @@ GOTO USAGE
 
 :ARGS_DONE
 IF NOT DEFINED OUTPUT_ROOT SET "OUTPUT_ROOT=%SCRIPT_ROOT%..\..\win64-gmp-mpfr-runs\%RUN_ID%"
+CALL :DETECT_NATIVE_OS_ARCH
+IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
+CALL :SET_TEST_TARGET "%NATIVE_OS_ARCH%"
 SETLOCAL DisableDelayedExpansion
 
 IF DEFINED SELF_TEST GOTO SELF_TEST
@@ -138,9 +143,10 @@ CALL :RUN_CD_GMP
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 CALL :RUN nmake /f win64\Makefile clean
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
-SET "RUN_ACTION=build-check"
+SET "RUN_ACTION=build-link"
+IF DEFINED TEST_TARGET SET "RUN_ACTION=build-check"
 SET "RUN_LIBRARY=gmp"
-CALL :RUN nmake /f win64\Makefile %GMP_FLAGS% static_lib check
+CALL :RUN nmake /f win64\Makefile %GMP_FLAGS% static_lib %TEST_TARGET%
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 CALL :RUN_MKDIR_ENTRY
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
@@ -153,13 +159,14 @@ CALL :RUN nmake /f win64\Makefile clean
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 CALL :ENSURE_GMP_ALIAS
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
-SET "RUN_ACTION=build-check"
+SET "RUN_ACTION=build-link"
+IF DEFINED TEST_TARGET SET "RUN_ACTION=build-check"
 SET "RUN_LIBRARY=mpfr"
 IF DEFINED GMP_ALIAS_CREATED GOTO BUILD_STATIC_WITH_ALIAS
-CALL :RUN nmake /f win64\Makefile %MPFR_FLAGS% LIBGMP_BUILDDIR="%GMP_SOURCE%" static_lib check
+CALL :RUN nmake /f win64\Makefile %MPFR_FLAGS% LIBGMP_BUILDDIR="%GMP_SOURCE%" static_lib %TEST_TARGET%
 GOTO BUILD_STATIC_MPFR_DONE
 :BUILD_STATIC_WITH_ALIAS
-CALL :RUN nmake /f win64\Makefile %MPFR_FLAGS% LIBGMP_BUILDDIR=%MPFR_GMP_SOURCE% static_lib check
+CALL :RUN nmake /f win64\Makefile %MPFR_FLAGS% LIBGMP_BUILDDIR=%MPFR_GMP_SOURCE% static_lib %TEST_TARGET%
 :BUILD_STATIC_MPFR_DONE
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 CALL :REMOVE_GMP_ALIAS
@@ -185,9 +192,10 @@ CALL :RUN_CD_GMP
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 CALL :RUN nmake /f win64\Makefile clean
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
-SET "RUN_ACTION=build-check"
+SET "RUN_ACTION=build-link"
+IF DEFINED TEST_TARGET SET "RUN_ACTION=build-check"
 SET "RUN_LIBRARY=gmp"
-CALL :RUN nmake /f win64\Makefile %GMP_FLAGS% dynamic_lib check
+CALL :RUN nmake /f win64\Makefile %GMP_FLAGS% dynamic_lib %TEST_TARGET%
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 CALL :RUN_MKDIR_ENTRY
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
@@ -202,13 +210,14 @@ CALL :RUN nmake /f win64\Makefile clean
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 CALL :ENSURE_GMP_ALIAS
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
-SET "RUN_ACTION=build-check"
+SET "RUN_ACTION=build-link"
+IF DEFINED TEST_TARGET SET "RUN_ACTION=build-check"
 SET "RUN_LIBRARY=mpfr"
 IF DEFINED GMP_ALIAS_CREATED GOTO BUILD_DYNAMIC_WITH_ALIAS
-CALL :RUN nmake /f win64\Makefile %MPFR_FLAGS% LIBGMP_BUILDDIR="%GMP_SOURCE%" dynamic_lib check
+CALL :RUN nmake /f win64\Makefile %MPFR_FLAGS% LIBGMP_BUILDDIR="%GMP_SOURCE%" dynamic_lib %TEST_TARGET%
 GOTO BUILD_DYNAMIC_MPFR_DONE
 :BUILD_DYNAMIC_WITH_ALIAS
-CALL :RUN nmake /f win64\Makefile %MPFR_FLAGS% LIBGMP_BUILDDIR=%MPFR_GMP_SOURCE% dynamic_lib check
+CALL :RUN nmake /f win64\Makefile %MPFR_FLAGS% LIBGMP_BUILDDIR=%MPFR_GMP_SOURCE% dynamic_lib %TEST_TARGET%
 :BUILD_DYNAMIC_MPFR_DONE
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 CALL :REMOVE_GMP_ALIAS
@@ -362,6 +371,23 @@ ENDLOCAL & SET "GMP_ALIAS_NEEDED=" & SET "MPFR_GMP_SOURCE=%GMP_SOURCE%" & EXIT /
 :GMP_ALIAS_NEEDED
 ENDLOCAL & SET "GMP_ALIAS_NEEDED=1" & EXIT /B 0
 
+:DETECT_NATIVE_OS_ARCH
+SETLOCAL DisableDelayedExpansion
+SET "ARCH="
+FOR /F "delims=" %%I IN ('powershell -NoProfile -Command "try{$a=[Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString();if([string]::IsNullOrWhiteSpace($a)){exit 1};$a}catch{exit 1}"') DO IF NOT DEFINED ARCH SET "ARCH=%%I"
+IF NOT DEFINED ARCH (
+  ECHO ERROR: unable to determine the native Windows OS architecture.
+  ENDLOCAL & SET "RUN_RC=87" & EXIT /B 87
+)
+ENDLOCAL & SET "NATIVE_OS_ARCH=%ARCH%" & SET "RUN_RC=0" & EXIT /B 0
+
+:SET_TEST_TARGET
+SET "TEST_TARGET="
+IF /I "%~1"=="X64" SET "TEST_TARGET=check"
+IF /I "%~1"=="AMD64" SET "TEST_TARGET=check"
+SET "RUN_RC=0"
+EXIT /B 0
+
 :RUN_SUBST_CREATE
 SETLOCAL DisableDelayedExpansion
 CALL :RUN subst %GMP_ALIAS_DRIVE% "%GMP_SOURCE%"
@@ -418,6 +444,26 @@ IF NOT "%RUN_RC%"=="0" GOTO SELF_TEST_DONE
 powershell -NoProfile -Command "$lines=[IO.File]::ReadAllLines($env:COMMAND_LOG); $logs=@($lines|%%{($_ -split '\|')[5]}|Select-Object -Unique); if($lines.Count -ne 4 -or $logs.Count -ne 4 -or -not (($lines -join [Environment]::NewLine).Contains($env:BANG_DIR))){exit 1}"
 IF ERRORLEVEL 1 (
   SET "RUN_RC=91"
+  GOTO SELF_TEST_DONE
+)
+CALL :SET_TEST_TARGET X64
+IF /I NOT "%TEST_TARGET%"=="check" (
+  SET "RUN_RC=93"
+  GOTO SELF_TEST_DONE
+)
+CALL :SET_TEST_TARGET AMD64
+IF /I NOT "%TEST_TARGET%"=="check" (
+  SET "RUN_RC=94"
+  GOTO SELF_TEST_DONE
+)
+CALL :SET_TEST_TARGET ARM64
+IF DEFINED TEST_TARGET (
+  SET "RUN_RC=95"
+  GOTO SELF_TEST_DONE
+)
+CALL :SET_TEST_TARGET X86
+IF DEFINED TEST_TARGET (
+  SET "RUN_RC=96"
   GOTO SELF_TEST_DONE
 )
 CALL :RUN cmd /d /c exit 37

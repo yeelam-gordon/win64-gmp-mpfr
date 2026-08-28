@@ -297,8 +297,12 @@ function Get-OverlayRecord {
     Assert-Condition ($AllowDirty -or -not $dirty) 'Overlay repository is dirty; commit the five-file change or pass --allow-dirty-overlay for development evidence.'
 
     $files = @()
-    foreach ($relativeRoot in @('libgmp\win64', 'libmpfr\win64')) {
-        $root = Join-Path $RepositoryRoot $relativeRoot
+    foreach ($overlayRoot in @(
+        [ordered]@{ name = 'GMP'; relativePath = 'libgmp\win64' },
+        [ordered]@{ name = 'MPFR'; relativePath = 'libmpfr\win64' }
+    )) {
+        $root = Join-Path $RepositoryRoot $overlayRoot.relativePath
+        Assert-Condition (Test-Path -LiteralPath $root -PathType Container) "Required $($overlayRoot.name) overlay directory is missing: $root. Restore the overlay at '$($overlayRoot.relativePath)' before writing the manifest."
         foreach ($file in Get-ChildItem -LiteralPath $root -File -Recurse | Sort-Object FullName) {
             $relative = $file.FullName.Substring($RepositoryRoot.TrimEnd('\').Length + 1)
             $files += [ordered]@{
@@ -484,12 +488,29 @@ function Assert-NativeTestEvidence {
     Assert-Condition ($logText -match '(?im)\bPASS(?:ED)?\b') "Check log does not contain passing test evidence for $Library."
 }
 
+function ConvertTo-SupportedArchitecture {
+    param([string]$Architecture)
+    if ([string]::IsNullOrWhiteSpace($Architecture)) { return $null }
+    switch ($Architecture.Trim().ToLowerInvariant()) {
+        'x64' { return 'x64' }
+        'arm64' { return 'arm64' }
+        default { return $null }
+    }
+}
+
+function Get-NativeOSArchitecture {
+    try {
+        return ConvertTo-SupportedArchitecture ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString())
+    } catch {
+        return $null
+    }
+}
+
 function Test-IsNative {
-    param([string]$Target)
-    $native = [string]$env:PROCESSOR_ARCHITEW6432
-    if ([string]::IsNullOrWhiteSpace($native)) { $native = [string]$env:PROCESSOR_ARCHITECTURE }
-    if ($Target -eq 'arm64') { return $native -ieq 'ARM64' }
-    return $native -in @('AMD64', 'x86_64')
+    param([string]$Target, [string]$NativeArchitecture = (Get-NativeOSArchitecture))
+    $targetArchitecture = ConvertTo-SupportedArchitecture $Target
+    $hostArchitecture = ConvertTo-SupportedArchitecture $NativeArchitecture
+    return $null -ne $targetArchitecture -and $targetArchitecture -ceq $hostArchitecture
 }
 
 function Get-ExecutionLimitation {
@@ -498,6 +519,43 @@ function Get-ExecutionLimitation {
         return 'Native tests were run by the selected Makefile check target.'
     }
     return "Target architecture $Target differs from host/native architecture $NativeArchitecture; native runtime tests were not run."
+}
+
+function ConvertTo-ConciseDiagnosticText {
+    param([string]$Text, [int]$MaximumLength = 500)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $concise = ($Text -replace '\s+', ' ').Trim()
+    if ($concise.Length -le $MaximumLength) { return $concise }
+    return $concise.Substring(0, $MaximumLength - 3) + '...'
+}
+
+function Format-ErrorRecordDiagnostic {
+    param([Management.Automation.ErrorRecord]$ErrorRecord)
+    $parts = @("write-manifest failed: $(ConvertTo-ConciseDiagnosticText $ErrorRecord.Exception.Message)")
+
+    $category = [string]$ErrorRecord.CategoryInfo.Category
+    $target = ConvertTo-ConciseDiagnosticText ([string]$ErrorRecord.CategoryInfo.TargetName) 200
+    if (-not [string]::IsNullOrWhiteSpace($category)) {
+        $parts += $(if ($null -ne $target) { "Category=$category; Target=$target" } else { "Category=$category" })
+    }
+
+    $stack = ConvertTo-ConciseDiagnosticText $ErrorRecord.ScriptStackTrace 500
+    if ($null -ne $stack) {
+        $parts += "ScriptStack=$stack"
+    } elseif ($null -ne $ErrorRecord.InvocationInfo -and $ErrorRecord.InvocationInfo.ScriptLineNumber -gt 0) {
+        $scriptName = ConvertTo-ConciseDiagnosticText $ErrorRecord.InvocationInfo.ScriptName 300
+        $parts += "Location=${scriptName}:$($ErrorRecord.InvocationInfo.ScriptLineNumber)"
+    }
+
+    $innerMessages = @()
+    $inner = $ErrorRecord.Exception.InnerException
+    while ($null -ne $inner -and $innerMessages.Count -lt 5) {
+        $innerMessage = ConvertTo-ConciseDiagnosticText $inner.Message
+        if ($null -ne $innerMessage) { $innerMessages += $innerMessage }
+        $inner = $inner.InnerException
+    }
+    if ($innerMessages.Count -gt 0) { $parts += "Inner=$($innerMessages -join ' -> ')" }
+    return $parts -join ' | '
 }
 
 function Invoke-ExpectedFailure {
@@ -567,9 +625,30 @@ function Invoke-SelfTest {
         $armRecord = Get-ArtifactRecord 'arm64.obj|fixture|object|AA64' $work $started 'self-test'
         Assert-Condition ($x64Record.machine -eq '8664') 'x64 machine detection failed.'
         Assert-Condition ($armRecord.machine -eq 'AA64') 'Arm64 machine detection failed.'
+        Assert-Condition (Test-IsNative 'x64' 'x64') 'x64 target/host native match failed.'
+        Assert-Condition (Test-IsNative 'arm64' 'arm64') 'Arm64 target/host native match failed.'
+        Assert-Condition (-not (Test-IsNative 'x64' 'arm64')) 'x64 target was incorrectly native on an Arm64 host.'
+        Assert-Condition (-not (Test-IsNative 'arm64' 'x64')) 'Arm64 target was incorrectly native on an x64 host.'
+        Assert-Condition (-not (Test-IsNative 'x64' 'unknown')) 'Unknown host architecture did not fail closed.'
+        Assert-Condition (-not (Test-IsNative 'unknown' 'x64')) 'Unknown target architecture did not fail closed.'
         Assert-Condition ((Get-ExecutionLimitation 'x64' 'ARM64' $false) -ceq 'Target architecture x64 differs from host/native architecture ARM64; native runtime tests were not run.') 'x64 non-native limitation text is inaccurate.'
         Assert-Condition ((Get-ExecutionLimitation 'arm64' 'AMD64' $false) -ceq 'Target architecture arm64 differs from host/native architecture AMD64; native runtime tests were not run.') 'Arm64 non-native limitation text is inaccurate.'
         Assert-Condition ((Get-ExecutionLimitation 'x64' 'AMD64' $true) -ceq 'Native tests were run by the selected Makefile check target.') 'Native limitation text changed unexpectedly.'
+
+        $diagnosticException = New-Object ApplicationException(
+            "outer diagnostic failure`nwith detail",
+            (New-Object InvalidOperationException('inner diagnostic cause'))
+        )
+        $diagnosticRecord = New-Object Management.Automation.ErrorRecord(
+            $diagnosticException,
+            'ManifestSelfTestFailure',
+            [Management.Automation.ErrorCategory]::InvalidData,
+            'fixture-target'
+        )
+        $diagnostic = Format-ErrorRecordDiagnostic $diagnosticRecord
+        Assert-Condition ($diagnostic.Contains('write-manifest failed: outer diagnostic failure with detail')) 'Error diagnostic omitted or failed to normalize the exception message.'
+        Assert-Condition ($diagnostic.Contains('Category=InvalidData; Target=fixture-target')) 'Error diagnostic omitted category or target context.'
+        Assert-Condition ($diagnostic.Contains('Inner=inner diagnostic cause')) 'Error diagnostic omitted the inner exception chain.'
 
         Invoke-ExpectedFailure { Get-ArtifactRecord 'missing.obj|fixture|object|8664' $work $started 'negative' } 'missing'
         $empty = Join-Path $work 'empty.obj'
@@ -615,6 +694,37 @@ function Invoke-SelfTest {
         $sourceRecord = Get-SourceRecord 'fixture' $metadata $source $overlay $work
         Assert-Condition ($sourceRecord.version -eq '1.0') 'Source identity positive test failed.'
         Assert-Condition ($sourceRecord.extractedFileCount -eq 2 -and $sourceRecord.appliedOverlayFileCount -eq 1) 'Source tree binding positive test failed.'
+
+        $overlayRepository = Join-Path $work 'overlay-repository'
+        $gmpOverlayRoot = Join-Path $overlayRepository 'libgmp\win64'
+        $mpfrOverlayRoot = Join-Path $overlayRepository 'libmpfr\win64'
+        New-Item -ItemType Directory -Path $gmpOverlayRoot, $mpfrOverlayRoot | Out-Null
+        Set-Content -LiteralPath (Join-Path $gmpOverlayRoot 'Makefile') -Value 'gmp overlay'
+        Set-Content -LiteralPath (Join-Path $mpfrOverlayRoot 'Makefile') -Value 'mpfr overlay'
+        $git = Get-Command git -ErrorAction Stop
+        & $git.Source -C $overlayRepository init --quiet
+        Assert-Condition ($LASTEXITCODE -eq 0) 'Unable to initialize overlay-root self-test repository.'
+        & $git.Source -C $overlayRepository add .
+        Assert-Condition ($LASTEXITCODE -eq 0) 'Unable to stage overlay-root self-test files.'
+        & $git.Source -C $overlayRepository -c user.name=write-manifest-self-test -c user.email=self-test@example.invalid commit --quiet -m 'overlay fixtures'
+        Assert-Condition ($LASTEXITCODE -eq 0) 'Unable to commit overlay-root self-test files.'
+        foreach ($missingOverlay in @(
+            [ordered]@{ name = 'GMP'; path = $gmpOverlayRoot; relativePath = 'libgmp\win64' },
+            [ordered]@{ name = 'MPFR'; path = $mpfrOverlayRoot; relativePath = 'libmpfr\win64' }
+        )) {
+            Remove-Item -LiteralPath $missingOverlay.path -Recurse -Force
+            $failureMessage = ''
+            try {
+                Get-OverlayRecord $overlayRepository $true | Out-Null
+            } catch {
+                $failureMessage = $_.Exception.Message
+            }
+            Assert-Condition (-not [string]::IsNullOrWhiteSpace($failureMessage)) "Self-test 'missing-$($missingOverlay.name.ToLowerInvariant())-overlay' did not fail closed."
+            Assert-Condition ($failureMessage.Contains($missingOverlay.path)) "Missing $($missingOverlay.name) overlay failure did not identify the missing path."
+            Assert-Condition ($failureMessage.Contains("Restore the overlay at '$($missingOverlay.relativePath)'")) "Missing $($missingOverlay.name) overlay failure was not action-oriented."
+            New-Item -ItemType Directory -Path $missingOverlay.path | Out-Null
+            Set-Content -LiteralPath (Join-Path $missingOverlay.path 'Makefile') -Value "$($missingOverlay.name.ToLowerInvariant()) overlay"
+        }
 
         $maliciousMembers = @(
             '../archive-escape.txt',
@@ -790,8 +900,9 @@ try {
     $commands = Get-CommandRecords $CommandLog $root $RunStartUtc
     Assert-Condition (-not ($commands | Where-Object { $_.exitCode -ne 0 })) 'A successful manifest cannot include a failed command.'
 
-    $nativeArchitecture = $(if ([string]::IsNullOrWhiteSpace([string]$env:PROCESSOR_ARCHITEW6432)) { [string]$env:PROCESSOR_ARCHITECTURE } else { [string]$env:PROCESSOR_ARCHITEW6432 })
-    $native = Test-IsNative $Architecture
+    $nativeArchitecture = Get-NativeOSArchitecture
+    if ($null -eq $nativeArchitecture) { $nativeArchitecture = 'unknown' }
+    $native = Test-IsNative $Architecture $nativeArchitecture
     $assemblerRequired = $Entry -match 'assembly' -and $Entry -notmatch 'noassembly'
     $libraries = @()
     foreach ($name in @('gmp', 'mpfr')) {
@@ -854,6 +965,6 @@ try {
     Write-Host "Entry manifest: $manifestPath"
     exit 0
 } catch {
-    Write-Error $_.Exception.Message
+    [Console]::Error.WriteLine((Format-ErrorRecordDiagnostic $_))
     exit 1
 }
