@@ -31,7 +31,7 @@ Please follow these steps:
 3. Lookup your patch utility (has to be declared as the makefile variable 'PATCH' - the default value assumes a GIT on MS Windows installation and is: "c:\Program Files\Git\usr\bin\patch.exe");
 4. Enter the source folder and patch the source codes: `nmake /f win64/Makefile patch`;
 5. Build the optimized library version using: `nmake /f win64/Makefile ASSEMBLY=` (this automatically executes the test suite and subsequently builds the tuneup.exe tool); for libmpfr, you have to define the Makefile variable 'LIBGMP_BUILDDIR=path' (the built libgmp has to be there), i.e. `nmake /f win64/Makefile LIBGMP_BUILDDIR=..\gmp-6.3.0`;
-6. For ARM64 builds, add the Makefile variable '**ARM64=**' to the command line. A cross build proves only compilation/linking and artifact machine type; it must not be reported as native test execution. The prebuilt batch script therefore omits the `check` target when its process is not running natively on Arm64 and records `not_run_cross` in the manifest;
+6. For ARM64 builds, add the Makefile variable '**ARM64=**' to the command line. A cross build proves only compilation/linking and artifact machine type; it must not be reported as native test execution. The prebuilt batch script therefore omits the `check` target when the native host OS/CPU architecture reported by `RuntimeInformation.OSArchitecture` is not Arm64 and records `not_run_cross` in the manifest;
 7. Optional: execute tuneup.exe by typing `tune\tuneup.exe` (please do read the bugs section below).
 
 Please see below for the full explanation of all build variables (also documented in the header section of the win64\Makefile).
