@@ -22,7 +22,7 @@ You need three things:
 
 ## Build instructions in a nutshell (for the impatient)
 
-This build was created for and tested with libgmp, version 6.3.0, and libmpfr, version 4.2.2 on MS Windows 11/64bit (X86-64 and ARM64). You can either build a static library with the test suite and the tuneup utility or the dynamic library with a static import library and the test suite (no tuneup in this case).
+This build supports libgmp 6.3.0 and libmpfr 4.2.2 on 64-bit Windows for X86-64 and ARM64. The Arm64 implementation already exists in this repository; the provenance pipeline described below does not claim to add first-time Arm64 support. A native build can produce either a static library with its test suite and tuneup utility or a dynamic library with a static import library and its test suite (no tuneup in this case).
 
 Please follow these steps:
 
@@ -31,7 +31,7 @@ Please follow these steps:
 3. Lookup your patch utility (has to be declared as the makefile variable 'PATCH' - the default value assumes a GIT on MS Windows installation and is: "c:\Program Files\Git\usr\bin\patch.exe");
 4. Enter the source folder and patch the source codes: `nmake /f win64/Makefile patch`;
 5. Build the optimized library version using: `nmake /f win64/Makefile ASSEMBLY=` (this automatically executes the test suite and subsequently builds the tuneup.exe tool); for libmpfr, you have to define the Makefile variable 'LIBGMP_BUILDDIR=path' (the built libgmp has to be there), i.e. `nmake /f win64/Makefile LIBGMP_BUILDDIR=..\gmp-6.3.0`;
-6. For ARM64 builds, add the Makefile variable '**ARM64=**' to the command line (if you are using a cross build environment, then modify the Makefile variables, see below, to exclude the test suite!);
+6. For ARM64 builds, add the Makefile variable '**ARM64=**' to the command line. A cross build proves only compilation/linking and artifact machine type; it must not be reported as native test execution. The prebuilt batch script therefore omits the `check` target when its process is not running natively on Arm64 and records `not_run_cross` in the manifest;
 7. Optional: execute tuneup.exe by typing `tune\tuneup.exe` (please do read the bugs section below).
 
 Please see below for the full explanation of all build variables (also documented in the header section of the win64\Makefile).
@@ -106,7 +106,7 @@ For DLLs, a version resource is added, which contains the library version number
 
 ## Known bugs and problems
 
-First of all, all builds (static and dynamic, X86-64 and ARM64) work with and without assembler. Please always build the test suite and execute it (Makefile target 'check') before using your build in a production environment.
+As of 2026-08-27, the repository contains static/dynamic and assembly/no-assembly build paths for X86-64 and ARM64. Local AMD64 evidence can verify X86-64 runtime tests and Arm64 cross-build machine type, but it is not evidence that Arm64 tests ran natively. Run the Makefile target `check` on the target architecture before using a build in production.
 
 The tuneup.exe tool of libmpfr works on both architectures (X86-64 and ARM64). The tuneup.exe tool of libgmp **stops** for X86-64 on MS Windows with the error message:
 
@@ -120,4 +120,36 @@ The toplevel folder 'prebuilt' contains two batch files, which build several lib
 
 The two batch files also illustrate the usage of various Makefile variables to control the build(s).
 
-The batch files start by patching both library source folders (they assume gmp 6.3.0 and mpfr 4.2.2, please adjust the folder names in the batch files if necessary).
+The checked-in binaries are legacy outputs without a manifest-backed, immutable from-source record and are therefore **unverified**. In particular, existing `*_full64bit` binaries must not be treated as verified: older scripts passed the misspelled `FULL64_BIT=` variable, which the GMP Makefile ignored. Hashing a legacy binary does not certify it.
+
+### Locked and manifest-backed builds
+
+`prebuilt\sources.json` is the single source of truth for the GMP and MPFR versions, canonical HTTPS archive URLs, extracted directory names, and SHA-512 hashes. Keep each locked archive beside its extracted source directory. The default source directories are siblings of the repository (`..\gmp-6.3.0` and `..\mpfr-4.2.2`); explicit paths remain available. The scripts accept:
+
+```text
+buildall-x86-64.bat [--gmp-source DIR] [--mpfr-source DIR] [--output EMPTY_DIR] [--entry NAME] [--arch AVX2]
+buildall-arm64.bat  [--gmp-source DIR] [--mpfr-source DIR] [--output EMPTY_DIR] [--entry NAME]
+```
+
+The x64 default remains `ARCH=AVX2`; an override is explicit in both the command and manifest. `FULL_64BIT=` entries contain GMP only because that option is incompatible with MPFR.
+
+Every run uses a new, initially empty staging directory. By default it is created beside, not inside, the Git checkout (`..\win64-gmp-mpfr-runs\<run-id>`), so a clean certification run does not dirty its own overlay. Commands are fail-fast and logged with structured action/library fields, exact exit codes, timestamps, and in-staging output paths. Artifacts are copied only after their associated build and applicable tests succeed. `prebuilt\write-manifest.ps1` then records locked source identities, overlay commit and dirty state, tool paths/versions, matrix variables, validated command logs, per-library status, artifact size/hash/class, and PE/COFF machine (`8664` for x64 or `AA64` for Arm64).
+
+Before patching or compiling, the writer extracts each SHA-512-locked archive into temporary validation storage and compares every source file byte-for-byte with the selected build tree. The only permitted archive-external subtree is `win64`, which must itself match the corresponding repository overlay exactly. Missing, additional, or modified compiled inputs fail certification. Artifact validation also rejects missing, empty, duplicate, pre-run, outside-staging, wrong-machine, misclassified, or unhashed outputs, and it will not certify files under the legacy prebuilt directories.
+
+The unchanged MPFR Makefile cannot consume a `LIBGMP_BUILDDIR` containing spaces. When required, the batch scripts allocate an unused drive letter with `subst` as a run-scoped, space-free alias for the already validated GMP source tree. Alias creation and removal are checked and logged; the alias is removed before certification, including failure cleanup. Space-free paths continue to use the original direct path.
+
+Useful verification commands:
+
+```powershell
+powershell -NoProfile -File prebuilt\write-manifest.ps1 -SelfTest
+prebuilt\buildall-x86-64.bat --self-test-fail-fast
+prebuilt\buildall-arm64.bat --self-test-fail-fast
+Select-String prebuilt\buildall-*.bat -Pattern 'FULL64_BIT|FULL_64BIT'
+```
+
+The self-tests create fixtures only below `prebuilt\.test-work\` and remove them afterward. A successful run writes per-entry manifests and an aggregate `manifest.json` inside its staging root. Promotion to a release/prebuilt location must be a separate atomic operation performed only after all applicable checks pass; these scripts never overwrite the checked-in prebuilts.
+
+Native runtime evidence and cross-build evidence are deliberately separate. `native_tests_passed` is emitted only when each applicable library has exactly one successful structured `build-check` record for the current entry and its in-staging log contains passing test evidence. Missing, stale, fake, or library/action-mismatched evidence fails closed. An Arm64 build performed by an AMD64 process is recorded as `not_run_cross`, even when compilation, linking, hashing, and `AA64` inspection succeed. Native Arm64 runtime certification requires execution on Windows Arm64 and is not provided by the current Tier 1 work.
+
+The known GMP X86-64 `tuneup.exe` assertion above is distinct from a library test-suite failure. This provenance work makes no performance claim and does not claim to unblock PrusaSlicer or any other downstream project.

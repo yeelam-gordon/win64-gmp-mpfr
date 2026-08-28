@@ -1,0 +1,734 @@
+[CmdletBinding(DefaultParameterSetName = 'Write')]
+param(
+    [Parameter(ParameterSetName = 'SelfTest', Mandatory = $true)]
+    [switch]$SelfTest,
+
+    [Parameter(ParameterSetName = 'Write')]
+    [Parameter(ParameterSetName = 'ValidateSources')]
+    [Parameter(ParameterSetName = 'Aggregate')]
+    [string]$SourcesFile,
+
+    [Parameter(ParameterSetName = 'Write')]
+    [Parameter(ParameterSetName = 'ValidateSources')]
+    [Parameter(ParameterSetName = 'Aggregate')]
+    [string]$StagingRoot,
+
+    [Parameter(ParameterSetName = 'Write')]
+    [Parameter(ParameterSetName = 'ValidateSources')]
+    [string]$GmpSource,
+
+    [Parameter(ParameterSetName = 'Write')]
+    [Parameter(ParameterSetName = 'ValidateSources')]
+    [string]$MpfrSource,
+
+    [Parameter(ParameterSetName = 'Write')]
+    [Parameter(ParameterSetName = 'ValidateSources')]
+    [datetime]$RunStartUtc,
+
+    [Parameter(ParameterSetName = 'Write')]
+    [Parameter(ParameterSetName = 'ValidateSources')]
+    [Parameter(ParameterSetName = 'Aggregate')]
+    [string]$RunId,
+
+    [Parameter(ParameterSetName = 'Write')]
+    [Parameter(ParameterSetName = 'ValidateSources')]
+    [ValidateSet('x64', 'arm64')]
+    [string]$Architecture,
+
+    [Parameter(ParameterSetName = 'Write')]
+    [string]$Entry,
+
+    [Parameter(ParameterSetName = 'Write')]
+    [string]$MakeVariables = '',
+
+    [Parameter(ParameterSetName = 'Write')]
+    [string]$ArtifactSpec = '',
+
+    [Parameter(ParameterSetName = 'Write')]
+    [string]$CommandLog,
+
+    [Parameter(ParameterSetName = 'Write')]
+    [string]$OutputPath,
+
+    [Parameter(ParameterSetName = 'Write')]
+    [switch]$ValidateOnly,
+
+    [Parameter(ParameterSetName = 'ValidateSources', Mandatory = $true)]
+    [switch]$ValidateSourcesOnly,
+
+    [Parameter(ParameterSetName = 'Aggregate', Mandatory = $true)]
+    [switch]$Aggregate,
+
+    [Parameter(ParameterSetName = 'Write')]
+    [Parameter(ParameterSetName = 'ValidateSources')]
+    [switch]$AllowDirtyOverlay
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($SourcesFile)) {
+    $SourcesFile = Join-Path $PSScriptRoot 'sources.json'
+}
+
+function Assert-Condition {
+    param([bool]$Condition, [string]$Message)
+    if (-not $Condition) {
+        throw $Message
+    }
+}
+
+function Get-FullPath {
+    param([string]$Path)
+    return [System.IO.Path]::GetFullPath($Path)
+}
+
+function Get-FileDigest {
+    param([string]$Path, [ValidateSet('SHA256', 'SHA512')][string]$Algorithm)
+    $hasher = [Security.Cryptography.HashAlgorithm]::Create($Algorithm)
+    Assert-Condition ($null -ne $hasher) "Hash algorithm is unavailable: $Algorithm"
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        $bytes = $hasher.ComputeHash($stream)
+        return ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+    } finally {
+        $stream.Dispose()
+        $hasher.Dispose()
+    }
+}
+
+function Get-TextDigest {
+    param([string]$Text)
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($Text)
+        return ([BitConverter]::ToString($hasher.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant()
+    } finally {
+        $hasher.Dispose()
+    }
+}
+
+function Test-PathInside {
+    param([string]$Path, [string]$Root)
+    $fullPath = Get-FullPath $Path
+    $fullRoot = (Get-FullPath $Root).TrimEnd('\') + '\'
+    return $fullPath.StartsWith($fullRoot, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Read-SourceLock {
+    param([string]$Path)
+    Assert-Condition (Test-Path -LiteralPath $Path -PathType Leaf) "Source lock does not exist: $Path"
+    $lock = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    Assert-Condition ($lock.schemaVersion -eq 1) 'Unsupported sources.json schemaVersion.'
+    foreach ($name in @('gmp', 'mpfr')) {
+        $item = $lock.$name
+        Assert-Condition ($null -ne $item) "Missing '$name' source metadata."
+        Assert-Condition ([string]$item.url -match '^https://') "$name URL must use HTTPS."
+        Assert-Condition ([string]$item.url -notmatch '(?i)latest|current') "$name URL must be immutable."
+        Assert-Condition ([string]$item.sha512 -match '^[0-9a-f]{128}$') "$name SHA-512 is invalid."
+        Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$item.extractedDirectory)) "$name extracted directory is missing."
+    }
+    return $lock
+}
+
+function Assert-TreeMatches {
+    param(
+        [string]$ReferenceRoot,
+        [string]$CandidateRoot,
+        [string[]]$AllowedCandidatePrefixes = @()
+    )
+    Assert-Condition (Test-Path -LiteralPath $ReferenceRoot -PathType Container) "Reference tree is missing: $ReferenceRoot"
+    Assert-Condition (Test-Path -LiteralPath $CandidateRoot -PathType Container) "Candidate tree is missing: $CandidateRoot"
+    $referenceFiles = @{}
+    foreach ($file in Get-ChildItem -LiteralPath $ReferenceRoot -File -Recurse -Force) {
+        Assert-Condition (-not ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) "Reference tree contains a reparse point: $($file.FullName)"
+        $relative = $file.FullName.Substring($ReferenceRoot.TrimEnd('\').Length + 1)
+        $referenceFiles[$relative.ToLowerInvariant()] = [ordered]@{
+            path = $relative
+            sha256 = Get-FileDigest $file.FullName SHA256
+        }
+    }
+    $candidateFiles = @{}
+    foreach ($file in Get-ChildItem -LiteralPath $CandidateRoot -File -Recurse -Force) {
+        Assert-Condition (-not ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) "Candidate tree contains a reparse point: $($file.FullName)"
+        $relative = $file.FullName.Substring($CandidateRoot.TrimEnd('\').Length + 1)
+        $candidateFiles[$relative.ToLowerInvariant()] = [ordered]@{
+            path = $relative
+            sha256 = Get-FileDigest $file.FullName SHA256
+        }
+    }
+    foreach ($key in $referenceFiles.Keys) {
+        Assert-Condition ($candidateFiles.ContainsKey($key)) "Extracted source is missing locked file: $($referenceFiles[$key].path)"
+        Assert-Condition ($candidateFiles[$key].sha256 -ceq $referenceFiles[$key].sha256) "Extracted source differs from locked archive: $($referenceFiles[$key].path)"
+    }
+    foreach ($key in $candidateFiles.Keys) {
+        if ($referenceFiles.ContainsKey($key)) { continue }
+        $allowed = $false
+        foreach ($prefix in $AllowedCandidatePrefixes) {
+            if ($candidateFiles[$key].path.StartsWith($prefix.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                $allowed = $true
+                break
+            }
+        }
+        Assert-Condition $allowed "Extracted source contains an unlocked file: $($candidateFiles[$key].path)"
+    }
+    $identityLines = @($referenceFiles.Values | Sort-Object path | ForEach-Object { "$($_.path)=$($_.sha256)" })
+    return [ordered]@{
+        fileCount = $referenceFiles.Count
+        treeSha256 = Get-TextDigest ($identityLines -join "`n")
+    }
+}
+
+function Get-SourceRecord {
+    param(
+        [string]$Name,
+        $Metadata,
+        [string]$SourcePath,
+        [string]$OverlayPath,
+        [string]$ValidationRoot
+    )
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($SourcePath)) "$Name source path is required."
+    $source = Get-FullPath $SourcePath
+    Assert-Condition (Test-Path -LiteralPath $source -PathType Container) "$Name source directory does not exist: $source"
+    Assert-Condition ((Split-Path -Leaf $source) -ceq [string]$Metadata.extractedDirectory) "$Name source directory must be named '$($Metadata.extractedDirectory)'."
+    $identity = Join-Path $source ([string]$Metadata.identityFile)
+    Assert-Condition (Test-Path -LiteralPath $identity -PathType Leaf) "$Name extracted-source identity file is missing: $identity"
+    $identityText = Get-Content -LiteralPath $identity -Raw
+    $identityRegex = ''
+    $identityRegexProperty = $Metadata.PSObject.Properties['identityRegex']
+    if ($null -ne $identityRegexProperty) { $identityRegex = [string]$identityRegexProperty.Value }
+    if ([string]::IsNullOrWhiteSpace($identityRegex)) {
+        $identityRegex = [regex]::Escape([string]$Metadata.version)
+    }
+    Assert-Condition ($identityText -match $identityRegex) "$Name identity file does not match version $($Metadata.version)."
+
+    $archive = Join-Path (Split-Path -Parent $source) ([string]$Metadata.archive)
+    Assert-Condition (Test-Path -LiteralPath $archive -PathType Leaf) "$Name canonical archive is required beside the source directory: $archive"
+    $actualHash = Get-FileDigest $archive SHA512
+    Assert-Condition ($actualHash -ceq ([string]$Metadata.sha512).ToLowerInvariant()) "$Name archive SHA-512 does not match sources.json."
+    Assert-Condition (Test-Path -LiteralPath $OverlayPath -PathType Container) "$Name repository overlay is missing: $OverlayPath"
+
+    $validation = Join-Path $ValidationRoot ("source-validation-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $validation | Out-Null
+    try {
+        $tar = Get-Command tar.exe -ErrorAction Stop
+        & $tar.Source -xf $archive -C $validation
+        Assert-Condition ($LASTEXITCODE -eq 0) "$Name archive extraction failed."
+        $lockedSource = Join-Path $validation ([string]$Metadata.extractedDirectory)
+        $sourceIdentity = Assert-TreeMatches $lockedSource $source @('win64')
+        $overlayIdentity = Assert-TreeMatches $OverlayPath (Join-Path $source 'win64')
+    } finally {
+        if (Test-Path -LiteralPath $validation) { Remove-Item -LiteralPath $validation -Recurse -Force }
+    }
+
+    [ordered]@{
+        name = $Name
+        version = [string]$Metadata.version
+        url = [string]$Metadata.url
+        archive = [string]$Metadata.archive
+        archiveSha512 = $actualHash
+        extractedDirectory = [string]$Metadata.extractedDirectory
+        extractedSource = $source
+        extractedFileCount = $sourceIdentity.fileCount
+        extractedTreeSha256 = $sourceIdentity.treeSha256
+        identityFile = [string]$Metadata.identityFile
+        identitySha256 = Get-FileDigest $identity SHA256
+        appliedOverlayFileCount = $overlayIdentity.fileCount
+        appliedOverlayTreeSha256 = $overlayIdentity.treeSha256
+    }
+}
+
+function Get-OverlayRecord {
+    param([string]$RepositoryRoot, [bool]$AllowDirty)
+    $git = Get-Command git -ErrorAction Stop
+    $commit = (& $git.Source -C $RepositoryRoot rev-parse HEAD).Trim()
+    Assert-Condition ($LASTEXITCODE -eq 0 -and $commit -match '^[0-9a-f]{40}$') 'Unable to identify overlay Git commit.'
+    $status = @(& $git.Source -C $RepositoryRoot status --porcelain)
+    Assert-Condition ($LASTEXITCODE -eq 0) 'Unable to determine overlay dirty state.'
+    $dirty = $status.Count -gt 0
+    Assert-Condition ($AllowDirty -or -not $dirty) 'Overlay repository is dirty; commit the five-file change or pass --allow-dirty-overlay for development evidence.'
+
+    $files = @()
+    foreach ($relativeRoot in @('libgmp\win64', 'libmpfr\win64')) {
+        $root = Join-Path $RepositoryRoot $relativeRoot
+        foreach ($file in Get-ChildItem -LiteralPath $root -File -Recurse | Sort-Object FullName) {
+            $relative = $file.FullName.Substring($RepositoryRoot.TrimEnd('\').Length + 1)
+            $files += [ordered]@{
+                path = $relative
+                sha256 = Get-FileDigest $file.FullName SHA256
+            }
+        }
+    }
+    [ordered]@{
+        commit = $commit
+        dirty = $dirty
+        inputs = $files
+    }
+}
+
+function Get-ToolRecord {
+    param([string]$Name, [bool]$Required)
+    $command = Get-Command $Name -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $command) {
+        Assert-Condition (-not $Required) "Required build tool is not available: $Name"
+        return $null
+    }
+    $text = ''
+    try {
+        $text = ((& $command.Source 2>&1 | Select-Object -First 8) -join "`n").Trim()
+    } catch {
+        $text = $_.Exception.Message
+    }
+    [ordered]@{ name = $Name; path = $command.Source; version = $text }
+}
+
+function Get-MachineFromBytes {
+    param([byte[]]$Bytes, [string]$Path)
+    Assert-Condition ($Bytes.Length -ge 2) "Artifact is too small to contain a COFF header: $Path"
+    if ($Bytes.Length -ge 64 -and $Bytes[0] -eq 0x4d -and $Bytes[1] -eq 0x5a) {
+        $peOffset = [BitConverter]::ToInt32($Bytes, 0x3c)
+        Assert-Condition ($peOffset -ge 0 -and $peOffset + 6 -le $Bytes.Length) "Invalid PE header offset: $Path"
+        Assert-Condition ($Bytes[$peOffset] -eq 0x50 -and $Bytes[$peOffset + 1] -eq 0x45 -and $Bytes[$peOffset + 2] -eq 0 -and $Bytes[$peOffset + 3] -eq 0) "Invalid PE signature: $Path"
+        return ('{0:X4}' -f [BitConverter]::ToUInt16($Bytes, $peOffset + 4))
+    }
+    return ('{0:X4}' -f [BitConverter]::ToUInt16($Bytes, 0))
+}
+
+function Get-LibraryDetails {
+    param([byte[]]$Bytes, [string]$Path)
+    $signature = [Text.Encoding]::ASCII.GetString($Bytes, 0, [Math]::Min(8, $Bytes.Length))
+    Assert-Condition ($signature -ceq "!<arch>`n") "Invalid COFF library signature: $Path"
+    $offset = 8
+    $machines = @()
+    $hasImportObject = $false
+    while ($offset + 60 -le $Bytes.Length) {
+        $sizeText = [Text.Encoding]::ASCII.GetString($Bytes, $offset + 48, 10).Trim()
+        $memberSize = 0
+        Assert-Condition ([int]::TryParse($sizeText, [ref]$memberSize)) "Invalid COFF library member size: $Path"
+        $dataOffset = $offset + 60
+        Assert-Condition ($dataOffset + $memberSize -le $Bytes.Length) "Truncated COFF library member: $Path"
+        if ($memberSize -ge 8) {
+            $sig1 = [BitConverter]::ToUInt16($Bytes, $dataOffset)
+            $sig2 = [BitConverter]::ToUInt16($Bytes, $dataOffset + 2)
+            if ($sig1 -eq 0 -and $sig2 -eq 0xffff) {
+                $machines += ('{0:X4}' -f [BitConverter]::ToUInt16($Bytes, $dataOffset + 6))
+                $hasImportObject = $true
+            } elseif ($sig1 -eq 0x8664 -or $sig1 -eq 0xaa64) {
+                $machines += ('{0:X4}' -f $sig1)
+            }
+        }
+        $offset = $dataOffset + $memberSize
+        if (($offset % 2) -ne 0) { $offset++ }
+    }
+    $uniqueMachines = @($machines | Select-Object -Unique)
+    Assert-Condition ($uniqueMachines.Count -eq 1) "Library must contain exactly one recognized machine type: $Path"
+    [ordered]@{
+        machine = $uniqueMachines[0]
+        classification = $(if ($hasImportObject) { 'import' } else { 'static' })
+    }
+}
+
+function Get-ArtifactRecord {
+    param(
+        [string]$Spec,
+        [string]$Root,
+        [datetime]$Started,
+        [string]$CurrentEntry
+    )
+    $parts = @($Spec -split '\|', 5)
+    Assert-Condition ($parts.Count -ge 4) "Artifact spec must be relative-path|library|class|machine[|sha256]: $Spec"
+    $relativePath, $library, $declaredClass, $declaredMachine = $parts[0..3]
+    Assert-Condition ($library -in @('gmp', 'mpfr', 'fixture')) "Unknown artifact library: $library"
+    Assert-Condition ($declaredClass -in @('static', 'import', 'dll', 'object')) "Unknown artifact class: $declaredClass"
+    Assert-Condition ($declaredMachine.ToUpperInvariant() -in @('8664', 'AA64')) "Unknown declared machine: $declaredMachine"
+    Assert-Condition (-not [IO.Path]::IsPathRooted($relativePath)) "Artifact path must be relative to staging: $relativePath"
+    $path = Get-FullPath (Join-Path $Root $relativePath)
+    Assert-Condition (Test-PathInside $path $Root) "Artifact is outside staging root: $path"
+    Assert-Condition (Test-Path -LiteralPath $path -PathType Leaf) "Artifact is missing: $path"
+    $file = Get-Item -LiteralPath $path
+    Assert-Condition ($file.Length -gt 0) "Artifact is empty: $path"
+    Assert-Condition ($file.LastWriteTimeUtc -ge $Started.ToUniversalTime()) "Artifact predates the current run: $path"
+    Assert-Condition (-not ($CurrentEntry -match '(?i)full64bit' -and $library -eq 'mpfr')) 'MPFR artifacts are forbidden in FULL_64BIT entries.'
+
+    [byte[]]$bytes = [IO.File]::ReadAllBytes($path)
+    if ($declaredClass -eq 'dll') {
+        Assert-Condition ([IO.Path]::GetExtension($path) -ieq '.dll') "DLL classification requires a .dll artifact: $path"
+        $actualMachine = Get-MachineFromBytes $bytes $path
+        $actualClass = 'dll'
+    } elseif ($declaredClass -eq 'object') {
+        Assert-Condition ([IO.Path]::GetExtension($path) -in @('.obj', '.o')) "Object classification requires an object artifact: $path"
+        $actualMachine = Get-MachineFromBytes $bytes $path
+        $actualClass = 'object'
+    } else {
+        Assert-Condition ([IO.Path]::GetExtension($path) -ieq '.lib') "Library classification requires a .lib artifact: $path"
+        $details = Get-LibraryDetails $bytes $path
+        $actualMachine = $details.machine
+        $actualClass = $details.classification
+    }
+    Assert-Condition ($actualMachine -ceq $declaredMachine.ToUpperInvariant()) "Wrong artifact machine for ${relativePath}: expected $declaredMachine, found $actualMachine."
+    Assert-Condition ($actualClass -ceq $declaredClass) "Wrong artifact class for ${relativePath}: expected $declaredClass, found $actualClass."
+    $sha256 = Get-FileDigest $path SHA256
+    if ($parts.Count -eq 5 -and -not [string]::IsNullOrWhiteSpace($parts[4])) {
+        Assert-Condition ($sha256 -ceq $parts[4].ToLowerInvariant()) "Wrong declared SHA-256 for $relativePath."
+    }
+    [ordered]@{
+        path = $relativePath
+        library = $library
+        classification = $actualClass
+        machine = $actualMachine
+        size = $file.Length
+        sha256 = $sha256
+        lastWriteUtc = $file.LastWriteTimeUtc.ToString('o')
+    }
+}
+
+function Get-CommandRecords {
+    param([string]$Path, [string]$Root, [datetime]$Started)
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($Path)) 'Command log is required.'
+    $fullPath = Get-FullPath $Path
+    Assert-Condition (Test-PathInside $fullPath $Root) 'Command log must be inside staging root.'
+    Assert-Condition (Test-Path -LiteralPath $fullPath -PathType Leaf) "Command log is missing: $fullPath"
+    Assert-Condition ((Get-Item -LiteralPath $fullPath).LastWriteTimeUtc -ge $Started.ToUniversalTime()) 'Command log predates the current run.'
+    $records = @()
+    foreach ($line in Get-Content -LiteralPath $fullPath) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $parts = @($line -split '\|', 7)
+        Assert-Condition ($parts.Count -eq 7) "Malformed command log record: $line"
+        $exitCode = 0
+        Assert-Condition ([int]::TryParse($parts[4], [ref]$exitCode)) "Malformed command exit code: $line"
+        $timestamp = [datetimeoffset]::MinValue
+        Assert-Condition ([datetimeoffset]::TryParse($parts[0], [ref]$timestamp)) "Malformed command timestamp: $line"
+        Assert-Condition ($timestamp.UtcDateTime -ge $Started.ToUniversalTime()) "Command timestamp predates run start: $line"
+        Assert-Condition ($timestamp.UtcDateTime -le [datetime]::UtcNow.AddMinutes(5)) "Command timestamp is in the future: $line"
+        Assert-Condition (-not [IO.Path]::IsPathRooted($parts[5])) "Command log path must be relative: $line"
+        $recordLog = Get-FullPath (Join-Path $Root $parts[5])
+        Assert-Condition (Test-PathInside $recordLog $Root) "Command output log is outside staging: $line"
+        Assert-Condition (Test-Path -LiteralPath $recordLog -PathType Leaf) "Command output log is missing: $recordLog"
+        $recordLogItem = Get-Item -LiteralPath $recordLog
+        Assert-Condition ($recordLogItem.LastWriteTimeUtc -ge $Started.ToUniversalTime()) "Command output log predates the run: $recordLog"
+        $records += [ordered]@{
+            timestamp = $parts[0]
+            entry = $parts[1]
+            action = $parts[2]
+            library = $(if ($parts[3] -eq '-') { $null } else { $parts[3] })
+            exitCode = $exitCode
+            log = $parts[5]
+            command = $parts[6]
+        }
+    }
+    return $records
+}
+
+function Assert-NativeTestEvidence {
+    param($Records, [string]$Library, [string]$CurrentEntry, [string]$Root)
+    $matches = @($Records | Where-Object {
+        $_.entry -ceq $CurrentEntry -and
+        $_.action -ceq 'build-check' -and
+        $_.library -ceq $Library -and
+        $_.exitCode -eq 0 -and
+        $_.command -match '(?i)^nmake(?:\.exe)?\s' -and
+        $_.command -match '(?i)(?:^|\s)check(?:\s|$)'
+    })
+    Assert-Condition ($matches.Count -eq 1) "Exactly one successful structured check record is required for $Library in entry '$CurrentEntry'."
+    $logPath = Get-FullPath (Join-Path $Root $matches[0].log)
+    Assert-Condition ((Get-Item -LiteralPath $logPath).Length -gt 0) "Check log is empty for $Library."
+    $logText = Get-Content -LiteralPath $logPath -Raw
+    Assert-Condition ($logText -match '(?im)\bPASS(?:ED)?\b') "Check log does not contain passing test evidence for $Library."
+}
+
+function Test-IsNative {
+    param([string]$Target)
+    $native = [string]$env:PROCESSOR_ARCHITEW6432
+    if ([string]::IsNullOrWhiteSpace($native)) { $native = [string]$env:PROCESSOR_ARCHITECTURE }
+    if ($Target -eq 'arm64') { return $native -ieq 'ARM64' }
+    return $native -in @('AMD64', 'x86_64')
+}
+
+function Invoke-ExpectedFailure {
+    param([scriptblock]$Action, [string]$Name)
+    $failed = $false
+    try { & $Action } catch { $failed = $true }
+    Assert-Condition $failed "Self-test '$Name' did not fail closed."
+}
+
+function New-CoffObject {
+    param([string]$Path, [UInt16]$Machine)
+    $bytes = New-Object byte[] 20
+    [BitConverter]::GetBytes($Machine).CopyTo($bytes, 0)
+    [IO.File]::WriteAllBytes($Path, $bytes)
+}
+
+function Invoke-SelfTest {
+    $work = Join-Path $PSScriptRoot '.test-work\manifest-self-test'
+    if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+    New-Item -ItemType Directory -Path $work | Out-Null
+    try {
+        $started = [datetime]::UtcNow.AddSeconds(-1)
+        $x64 = Join-Path $work 'x64.obj'
+        $arm64 = Join-Path $work 'arm64.obj'
+        New-CoffObject $x64 0x8664
+        New-CoffObject $arm64 0xaa64
+        $x64Record = Get-ArtifactRecord 'x64.obj|fixture|object|8664' $work $started 'self-test'
+        $armRecord = Get-ArtifactRecord 'arm64.obj|fixture|object|AA64' $work $started 'self-test'
+        Assert-Condition ($x64Record.machine -eq '8664') 'x64 machine detection failed.'
+        Assert-Condition ($armRecord.machine -eq 'AA64') 'Arm64 machine detection failed.'
+
+        Invoke-ExpectedFailure { Get-ArtifactRecord 'missing.obj|fixture|object|8664' $work $started 'negative' } 'missing'
+        $empty = Join-Path $work 'empty.obj'
+        [IO.File]::WriteAllBytes($empty, (New-Object byte[] 0))
+        Invoke-ExpectedFailure { Get-ArtifactRecord 'empty.obj|fixture|object|8664' $work $started 'negative' } 'empty'
+        Invoke-ExpectedFailure { Get-ArtifactRecord 'x64.obj|fixture|object|AA64' $work $started 'negative' } 'wrong-machine'
+        Invoke-ExpectedFailure { Get-ArtifactRecord 'x64.obj|fixture|mystery|8664' $work $started 'negative' } 'unknown-class'
+        Invoke-ExpectedFailure { Get-ArtifactRecord 'x64.obj|fixture|object|8664|deadbeef' $work $started 'negative' } 'wrong-hash'
+        (Get-Item $x64).LastWriteTimeUtc = $started.AddMinutes(-1)
+        Invoke-ExpectedFailure { Get-ArtifactRecord 'x64.obj|fixture|object|8664' $work $started 'negative' } 'pre-run'
+        (Get-Item $x64).LastWriteTimeUtc = [datetime]::UtcNow
+        $outside = Join-Path (Split-Path -Parent $work) 'outside.obj'
+        New-CoffObject $outside 0x8664
+        Invoke-ExpectedFailure { Get-ArtifactRecord '..\outside.obj|fixture|object|8664' $work $started 'negative' } 'outside-staging'
+        Remove-Item -LiteralPath $outside -Force
+        Invoke-ExpectedFailure { Get-ArtifactRecord 'arm64.obj|mpfr|object|AA64' $work $started 'release_static_assembly_full64bit' } 'mpfr-full64bit'
+
+        $sourceParent = Join-Path $work 'sources'
+        $archiveRoot = Join-Path $work 'archive-root'
+        $lockedSource = Join-Path $archiveRoot 'sample-1.0'
+        $source = Join-Path $sourceParent 'sample-1.0'
+        $overlay = Join-Path $work 'overlay'
+        New-Item -ItemType Directory -Path $lockedSource, $source, $overlay | Out-Null
+        Set-Content -LiteralPath (Join-Path $lockedSource 'configure.ac') -Value 'AC_INIT([sample], [1.0])'
+        Set-Content -LiteralPath (Join-Path $lockedSource 'source.c') -Value 'int locked_source;'
+        Copy-Item -LiteralPath (Join-Path $lockedSource 'configure.ac') -Destination $source
+        Copy-Item -LiteralPath (Join-Path $lockedSource 'source.c') -Destination $source
+        New-Item -ItemType Directory -Path (Join-Path $source 'win64') | Out-Null
+        Set-Content -LiteralPath (Join-Path $overlay 'Makefile') -Value 'locked overlay'
+        Copy-Item -LiteralPath (Join-Path $overlay 'Makefile') -Destination (Join-Path $source 'win64')
+        $archive = Join-Path $sourceParent 'sample-1.0.tar'
+        $tar = Get-Command tar.exe -ErrorAction Stop
+        & $tar.Source -cf $archive -C $archiveRoot 'sample-1.0'
+        Assert-Condition ($LASTEXITCODE -eq 0) 'Unable to create source-binding self-test archive.'
+        $metadata = [pscustomobject]@{
+            version = '1.0'
+            url = 'https://example.invalid/sample-1.0.tar'
+            archive = 'sample-1.0.tar'
+            sha512 = Get-FileDigest $archive SHA512
+            extractedDirectory = 'sample-1.0'
+            identityFile = 'configure.ac'
+        }
+        $sourceRecord = Get-SourceRecord 'fixture' $metadata $source $overlay $work
+        Assert-Condition ($sourceRecord.version -eq '1.0') 'Source identity positive test failed.'
+        Assert-Condition ($sourceRecord.extractedFileCount -eq 2 -and $sourceRecord.appliedOverlayFileCount -eq 1) 'Source tree binding positive test failed.'
+        Invoke-ExpectedFailure { Get-SourceRecord 'fixture' $metadata (Join-Path $sourceParent 'missing-1.0') $overlay $work } 'missing-source'
+        $wrongDirectoryMetadata = $metadata.PSObject.Copy()
+        $wrongDirectoryMetadata.extractedDirectory = 'sample-2.0'
+        Invoke-ExpectedFailure { Get-SourceRecord 'fixture' $wrongDirectoryMetadata $source $overlay $work } 'wrong-extracted-version'
+        $wrongHashMetadata = $metadata.PSObject.Copy()
+        $wrongHashMetadata.sha512 = ('0' * 128)
+        Invoke-ExpectedFailure { Get-SourceRecord 'fixture' $wrongHashMetadata $source $overlay $work } 'changed-archive-hash'
+        Set-Content -LiteralPath (Join-Path $source 'source.c') -Value 'int tampered_source;'
+        Invoke-ExpectedFailure { Get-SourceRecord 'fixture' $metadata $source $overlay $work } 'modified-extracted-source'
+        Copy-Item -LiteralPath (Join-Path $lockedSource 'source.c') -Destination $source -Force
+        Set-Content -LiteralPath (Join-Path $source 'win64\Makefile') -Value 'tampered overlay'
+        Invoke-ExpectedFailure { Get-SourceRecord 'fixture' $metadata $source $overlay $work } 'modified-applied-overlay'
+        Copy-Item -LiteralPath (Join-Path $overlay 'Makefile') -Destination (Join-Path $source 'win64') -Force
+
+        $evidenceRoot = Join-Path $work 'evidence'
+        New-Item -ItemType Directory -Path (Join-Path $evidenceRoot 'logs') | Out-Null
+        $evidenceLog = Join-Path $evidenceRoot 'logs\check.log'
+        Set-Content -LiteralPath $evidenceLog -Value 'Running test fixture ... PASS'
+        $evidenceLine = "{0}|entry|build-check|gmp|0|logs\check.log|nmake /f win64\Makefile static_lib check" -f [datetime]::UtcNow.ToString('o')
+        $evidenceFile = Join-Path $evidenceRoot 'commands.tsv'
+        Set-Content -LiteralPath $evidenceFile -Value $evidenceLine
+        $evidenceRecords = Get-CommandRecords $evidenceFile $evidenceRoot $started
+        Assert-NativeTestEvidence $evidenceRecords 'gmp' 'entry' $evidenceRoot
+        Set-Content -LiteralPath $evidenceLog -Value 'fabricated output without a test result'
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $evidenceRecords 'gmp' 'entry' $evidenceRoot } 'fake-check-log'
+        Set-Content -LiteralPath $evidenceLog -Value 'Running test fixture ... PASS'
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $evidenceRecords 'mpfr' 'entry' $evidenceRoot } 'mismatched-check-library'
+        Set-Content -LiteralPath $evidenceFile -Value ($evidenceLine -replace '\|build-check\|', '|build-link|')
+        $mismatchedRecords = Get-CommandRecords $evidenceFile $evidenceRoot $started
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $mismatchedRecords 'gmp' 'entry' $evidenceRoot } 'mismatched-check-action'
+        Remove-Item -LiteralPath $evidenceLog
+        Invoke-ExpectedFailure { Get-CommandRecords $evidenceFile $evidenceRoot $started } 'missing-check-log'
+
+        $legacy = Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'x86-64') -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $legacy) {
+            Invoke-ExpectedFailure { Get-ArtifactRecord $legacy.FullName $work $started 'legacy' } 'legacy-prebuilt'
+        }
+
+        $duplicates = @('x64.obj|fixture|object|8664', 'x64.obj|fixture|object|8664')
+        $seen = @{}
+        Invoke-ExpectedFailure {
+            foreach ($spec in $duplicates) {
+                $key = ($spec -split '\|', 2)[0].ToLowerInvariant()
+                Assert-Condition (-not $seen.ContainsKey($key)) "Duplicate artifact: $key"
+                $seen[$key] = $true
+            }
+        } 'duplicate'
+
+        Write-Host 'write-manifest self-test passed: x64=8664 arm64=AA64; all negative cases rejected.'
+    } finally {
+        if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+        $parent = Split-Path -Parent $work
+        if ((Test-Path -LiteralPath $parent) -and -not (Get-ChildItem -LiteralPath $parent -Force | Select-Object -First 1)) {
+            Remove-Item -LiteralPath $parent -Force
+        }
+    }
+}
+
+try {
+    if ($SelfTest) {
+        Invoke-SelfTest
+        exit 0
+    }
+
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($StagingRoot)) 'StagingRoot is required.'
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($RunId)) 'RunId is required.'
+    $root = Get-FullPath $StagingRoot
+
+    if ($Aggregate) {
+        Assert-Condition (Test-Path -LiteralPath $root -PathType Container) "Staging root does not exist: $root"
+        $entryFiles = @(Get-ChildItem -LiteralPath $root -Filter 'manifest.json' -File -Recurse | Where-Object { $_.DirectoryName -ne $root })
+        Assert-Condition ($entryFiles.Count -gt 0) 'No entry manifests were found for aggregation.'
+        $entries = @()
+        foreach ($file in $entryFiles | Sort-Object FullName) {
+            $item = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
+            Assert-Condition ($item.schemaVersion -eq 1 -and $item.runId -ceq $RunId) "Invalid or foreign entry manifest: $($file.FullName)"
+            $entries += $item
+        }
+        $aggregateManifest = [ordered]@{
+            schemaVersion = 1
+            runId = $RunId
+            completedUtc = [datetime]::UtcNow.ToString('o')
+            stagingRoot = $root
+            entries = $entries
+        }
+        $aggregatePath = Join-Path $root 'manifest.json'
+        $aggregateManifest | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $aggregatePath -Encoding UTF8
+        Write-Host "Aggregate manifest: $aggregatePath"
+        exit 0
+    }
+
+    Assert-Condition ($RunStartUtc -ne [datetime]::MinValue) 'RunStartUtc is required.'
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($Architecture)) 'Architecture is required.'
+    $lock = Read-SourceLock $SourcesFile
+    $repositoryRoot = Get-FullPath (Join-Path $PSScriptRoot '..')
+    $sourceReceiptPath = Join-Path $root 'source-validation.json'
+
+    if ($ValidateSourcesOnly) {
+        if (Test-Path -LiteralPath $root) {
+            Assert-Condition (Test-Path -LiteralPath $root -PathType Container) 'Output path exists and is not a directory.'
+            $unexpected = @(Get-ChildItem -LiteralPath $root -Force | Where-Object { $_.Name -notin @('logs', 'commands.tsv') })
+            Assert-Condition ($unexpected.Count -eq 0) 'Output/staging directory contained data before the current run.'
+        }
+        $gmpRecord = Get-SourceRecord 'gmp' $lock.gmp $GmpSource (Join-Path $repositoryRoot 'libgmp\win64') $root
+        $mpfrRecord = Get-SourceRecord 'mpfr' $lock.mpfr $MpfrSource (Join-Path $repositoryRoot 'libmpfr\win64') $root
+        $overlay = Get-OverlayRecord $repositoryRoot ([bool]$AllowDirtyOverlay)
+        $sourceReceipt = [ordered]@{
+            schemaVersion = 1
+            runId = $RunId
+            runStartUtc = $RunStartUtc.ToUniversalTime().ToString('o')
+            validatedUtc = [datetime]::UtcNow.ToString('o')
+            gmpSource = Get-FullPath $GmpSource
+            mpfrSource = Get-FullPath $MpfrSource
+            sources = @($gmpRecord, $mpfrRecord)
+            overlay = $overlay
+        }
+        $sourceReceipt | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $sourceReceiptPath -Encoding UTF8
+        Write-Host "Validated locked GMP $($lock.gmp.version), MPFR $($lock.mpfr.version), overlay $($overlay.commit)."
+        exit 0
+    }
+
+    Assert-Condition (Test-Path -LiteralPath $root -PathType Container) "Staging root does not exist: $root"
+    Assert-Condition (Test-Path -LiteralPath $sourceReceiptPath -PathType Leaf) 'Source-validation receipt is missing; run locked-source preflight first.'
+    $sourceReceiptItem = Get-Item -LiteralPath $sourceReceiptPath
+    Assert-Condition ($sourceReceiptItem.LastWriteTimeUtc -ge $RunStartUtc.ToUniversalTime()) 'Source-validation receipt predates the run.'
+    $sourceReceipt = Get-Content -LiteralPath $sourceReceiptPath -Raw | ConvertFrom-Json
+    Assert-Condition ($sourceReceipt.schemaVersion -eq 1 -and $sourceReceipt.runId -ceq $RunId) 'Source-validation receipt does not belong to this run.'
+    Assert-Condition ((Get-FullPath ([string]$sourceReceipt.gmpSource)) -ceq (Get-FullPath $GmpSource)) 'GMP source path differs from validated preflight.'
+    Assert-Condition ((Get-FullPath ([string]$sourceReceipt.mpfrSource)) -ceq (Get-FullPath $MpfrSource)) 'MPFR source path differs from validated preflight.'
+    $gmpRecord = $sourceReceipt.sources | Where-Object { $_.name -eq 'gmp' } | Select-Object -First 1
+    $mpfrRecord = $sourceReceipt.sources | Where-Object { $_.name -eq 'mpfr' } | Select-Object -First 1
+    Assert-Condition ($null -ne $gmpRecord -and $null -ne $mpfrRecord) 'Source-validation receipt is incomplete.'
+    Assert-Condition ((Get-FileDigest (Join-Path (Split-Path -Parent $GmpSource) ([string]$lock.gmp.archive)) SHA512) -ceq [string]$gmpRecord.archiveSha512) 'GMP archive changed after preflight.'
+    Assert-Condition ((Get-FileDigest (Join-Path (Split-Path -Parent $MpfrSource) ([string]$lock.mpfr.archive)) SHA512) -ceq [string]$mpfrRecord.archiveSha512) 'MPFR archive changed after preflight.'
+    $overlay = $sourceReceipt.overlay
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($Entry)) 'Entry is required.'
+    $artifactSpecs = @($ArtifactSpec -split ';;' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    Assert-Condition ($artifactSpecs.Count -gt 0) 'At least one artifact is required.'
+    $seenArtifacts = @{}
+    $artifacts = @()
+    foreach ($spec in $artifactSpecs) {
+        $relative = ($spec -split '\|', 2)[0]
+        $key = $relative.ToLowerInvariant()
+        Assert-Condition (-not $seenArtifacts.ContainsKey($key)) "Duplicate artifact path: $relative"
+        $seenArtifacts[$key] = $true
+        $artifacts += Get-ArtifactRecord $spec $root $RunStartUtc $Entry
+    }
+    $commands = Get-CommandRecords $CommandLog $root $RunStartUtc
+    Assert-Condition (-not ($commands | Where-Object { $_.exitCode -ne 0 })) 'A successful manifest cannot include a failed command.'
+
+    $native = Test-IsNative $Architecture
+    $assemblerRequired = $Entry -match 'assembly' -and $Entry -notmatch 'noassembly'
+    $libraries = @()
+    foreach ($name in @('gmp', 'mpfr')) {
+        if ($artifacts.library -contains $name) {
+            if ($native) {
+                Assert-NativeTestEvidence $commands $name $Entry $root
+            }
+            $libraries += [ordered]@{
+                name = $name
+                status = $(if ($native) { 'native_tests_passed' } else { 'not_run_cross' })
+            }
+        }
+    }
+    $manifest = [ordered]@{
+        schemaVersion = 1
+        runId = $RunId
+        runStartUtc = $RunStartUtc.ToUniversalTime().ToString('o')
+        entryCompletedUtc = [datetime]::UtcNow.ToString('o')
+        stagingRoot = $root
+        architecture = $Architecture
+        nativeExecution = $native
+        entry = $Entry
+        makeVariables = @($MakeVariables -split ';;' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        sources = @($gmpRecord, $mpfrRecord)
+        overlay = $overlay
+        environment = [ordered]@{
+            os = [Environment]::OSVersion.VersionString
+            processArchitecture = [string]$env:PROCESSOR_ARCHITECTURE
+            nativeArchitecture = $(if ([string]::IsNullOrWhiteSpace([string]$env:PROCESSOR_ARCHITEW6432)) { [string]$env:PROCESSOR_ARCHITECTURE } else { [string]$env:PROCESSOR_ARCHITEW6432 })
+            tools = @(
+                (Get-ToolRecord 'cl.exe' $true),
+                (Get-ToolRecord 'link.exe' $true),
+                (Get-ToolRecord 'lib.exe' $true),
+                (Get-ToolRecord 'nmake.exe' $true),
+                (Get-ToolRecord $(if ($Architecture -eq 'arm64') { 'armasm64.exe' } else { 'ml64.exe' }) $assemblerRequired)
+            )
+        }
+        commands = $commands
+        libraries = $libraries
+        artifacts = $artifacts
+        limitations = @(
+            'Existing checked-in prebuilt binaries are unverified and are not certified by this manifest.',
+            'FULL_64BIT= is GMP-only and is incompatible with MPFR.',
+            $(if ($native) { 'Native tests were run by the selected Makefile check target.' } else { 'Arm64 artifacts were cross-built; native runtime tests were not run.' })
+        )
+    }
+
+    if ($ValidateOnly) {
+        Write-Host "Manifest validation passed for entry '$Entry' ($($artifacts.Count) artifacts)."
+        exit 0
+    }
+    if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+        $OutputPath = Join-Path (Join-Path $root $Entry) 'manifest.json'
+    }
+    $manifestPath = Get-FullPath $OutputPath
+    Assert-Condition (Test-PathInside $manifestPath $root) 'Manifest output must be inside staging root.'
+    $manifestDirectory = Split-Path -Parent $manifestPath
+    if (-not (Test-Path -LiteralPath $manifestDirectory)) { New-Item -ItemType Directory -Path $manifestDirectory | Out-Null }
+    $manifest | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+    Write-Host "Entry manifest: $manifestPath"
+    exit 0
+} catch {
+    Write-Error $_.Exception.Message
+    exit 1
+}
