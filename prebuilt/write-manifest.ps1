@@ -185,10 +185,50 @@ function Read-SourceLock {
     foreach ($name in @('gmp', 'mpfr')) {
         $item = $lock.$name
         Assert-Condition ($null -ne $item) "Missing '$name' source metadata."
-        Assert-Condition ([string]$item.url -match '^https://') "$name URL must use HTTPS."
-        Assert-Condition ([string]$item.url -notmatch '(?i)latest|current') "$name URL must be immutable."
-        Assert-Condition ([string]$item.sha512 -match '^[0-9a-f]{128}$') "$name SHA-512 is invalid."
-        Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$item.extractedDirectory)) "$name extracted directory is missing."
+        $values = @{}
+        foreach ($field in @('version', 'url', 'archive', 'sha512', 'extractedDirectory', 'identityFile')) {
+            $property = $item.PSObject.Properties[$field]
+            Assert-Condition ($null -ne $property -and $null -ne $property.Value) "$name $field is missing."
+            Assert-Condition ($property.Value -is [string]) "$name $field must be a string."
+            $value = [string]$property.Value
+            Assert-Condition (-not [string]::IsNullOrWhiteSpace($value)) "$name $field is blank."
+            $values[$field] = $value
+        }
+
+        Assert-Condition ($values.version -match '^[0-9]+(?:\.[0-9]+)+(?:[-+._][0-9A-Za-z]+)*$') "$name version is invalid."
+
+        $url = $null
+        Assert-Condition ([uri]::TryCreate($values.url, [UriKind]::Absolute, [ref]$url)) "$name URL is invalid."
+        Assert-Condition ($url.Scheme -ceq [Uri]::UriSchemeHttps) "$name URL must use HTTPS."
+        Assert-Condition ([string]::IsNullOrEmpty($url.UserInfo) -and [string]::IsNullOrEmpty($url.Fragment)) "$name URL is invalid."
+        Assert-Condition ($values.url -notmatch '(?i)latest|current') "$name URL must be immutable."
+
+        Assert-Condition (
+            -not [IO.Path]::IsPathRooted($values.archive) -and
+            $values.archive -ceq [IO.Path]::GetFileName($values.archive) -and
+            $values.archive -notmatch '[\x00-\x1f<>:"/\\|?*]'
+        ) "$name archive filename is invalid."
+        $urlArchive = [Uri]::UnescapeDataString($url.Segments[$url.Segments.Length - 1])
+        Assert-Condition ($urlArchive -ceq $values.archive) "$name URL archive filename does not match archive."
+        Assert-Condition ($values.sha512 -match '^[0-9a-fA-F]{128}$') "$name SHA-512 is invalid."
+        Assert-Condition (
+            -not [IO.Path]::IsPathRooted($values.extractedDirectory) -and
+            $values.extractedDirectory -ceq [IO.Path]::GetFileName($values.extractedDirectory) -and
+            $values.extractedDirectory -notmatch '^(?:\.|\.\.)$|[\x00-\x1f<>:"/\\|?*]'
+        ) "$name extracted directory is invalid."
+        Assert-Condition (
+            -not [IO.Path]::IsPathRooted($values.identityFile) -and
+            $values.identityFile -notmatch '(^|[\\/])\.\.?([\\/]|$)|[\\/]{2}|[\\/]$|[\x00-\x1f<>:"|?*]'
+        ) "$name identity file is invalid."
+
+        $identityRegexProperty = $item.PSObject.Properties['identityRegex']
+        if ($null -ne $identityRegexProperty -and -not [string]::IsNullOrWhiteSpace([string]$identityRegexProperty.Value)) {
+            try {
+                [void][regex]::new([string]$identityRegexProperty.Value)
+            } catch {
+                throw "$name identity regex is invalid."
+            }
+        }
     }
     return $lock
 }
@@ -266,6 +306,8 @@ function Get-SourceRecord {
         [string]$OverlayPath,
         [string]$ValidationRoot
     )
+    $version = [string]$Metadata.version
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($version)) "$Name version is required."
     Assert-Condition (-not [string]::IsNullOrWhiteSpace($SourcePath)) "$Name source path is required."
     $source = Get-FullPath $SourcePath
     Assert-Condition (Test-Path -LiteralPath $source -PathType Container) "$Name source directory does not exist: $source"
@@ -277,9 +319,14 @@ function Get-SourceRecord {
     $identityRegexProperty = $Metadata.PSObject.Properties['identityRegex']
     if ($null -ne $identityRegexProperty) { $identityRegex = [string]$identityRegexProperty.Value }
     if ([string]::IsNullOrWhiteSpace($identityRegex)) {
-        $identityRegex = [regex]::Escape([string]$Metadata.version)
+        $identityRegex = [regex]::Escape($version)
     }
-    Assert-Condition ($identityText -match $identityRegex) "$Name identity file does not match version $($Metadata.version)."
+    try {
+        $identityPattern = [regex]::new($identityRegex)
+    } catch {
+        throw "$Name identity regex is invalid."
+    }
+    Assert-Condition ($identityPattern.IsMatch($identityText)) "$Name identity file does not match version $version."
 
     $archive = Join-Path (Split-Path -Parent $source) ([string]$Metadata.archive)
     Assert-Condition (Test-Path -LiteralPath $archive -PathType Leaf) "$Name canonical archive is required beside the source directory: $archive"
@@ -682,6 +729,57 @@ function Invoke-SelfTest {
         Assert-Condition ($diagnostic.Contains('Category=InvalidData; Target=fixture-target')) 'Error diagnostic omitted category or target context.'
         Assert-Condition ($diagnostic.Contains('Inner=inner diagnostic cause')) 'Error diagnostic omitted the inner exception chain.'
 
+        $sourceLockPath = Join-Path $work 'sources.json'
+        $validSourceLock = [ordered]@{
+            schemaVersion = 1
+            gmp = [ordered]@{
+                version = '6.3.0'
+                url = 'https://example.invalid/gmp-6.3.0.tar.xz'
+                archive = 'gmp-6.3.0.tar.xz'
+                sha512 = ('a' * 128)
+                extractedDirectory = 'gmp-6.3.0'
+                identityFile = 'gmp-h.in'
+            }
+            mpfr = [ordered]@{
+                version = '4.2.2'
+                url = 'https://example.invalid/mpfr-4.2.2.tar.xz'
+                archive = 'mpfr-4.2.2.tar.xz'
+                sha512 = ('b' * 128)
+                extractedDirectory = 'mpfr-4.2.2'
+                identityFile = 'configure.ac'
+            }
+        }
+        Set-Content -LiteralPath $sourceLockPath -Value ($validSourceLock | ConvertTo-Json -Depth 5)
+        Read-SourceLock $sourceLockPath | Out-Null
+        $invalidRequiredValues = @{
+            version = 'not a version'
+            url = 'http://example.invalid/source.tar.xz'
+            archive = '..\source.tar.xz'
+            sha512 = 'not-a-sha512'
+            extractedDirectory = '..\source'
+            identityFile = '..\configure.ac'
+        }
+        foreach ($sourceName in @('gmp', 'mpfr')) {
+            foreach ($field in @('version', 'url', 'archive', 'sha512', 'extractedDirectory', 'identityFile')) {
+                $missingLock = (($validSourceLock | ConvertTo-Json -Depth 5) | ConvertFrom-Json)
+                $missingLock.$sourceName.PSObject.Properties.Remove($field)
+                Set-Content -LiteralPath $sourceLockPath -Value ($missingLock | ConvertTo-Json -Depth 5)
+                Invoke-ExpectedFailure { Read-SourceLock $sourceLockPath } "$sourceName-$field-missing"
+
+                foreach ($blankValue in @($null, '', '   ')) {
+                    $blankLock = (($validSourceLock | ConvertTo-Json -Depth 5) | ConvertFrom-Json)
+                    $blankLock.$sourceName.$field = $blankValue
+                    Set-Content -LiteralPath $sourceLockPath -Value ($blankLock | ConvertTo-Json -Depth 5)
+                    Invoke-ExpectedFailure { Read-SourceLock $sourceLockPath } "$sourceName-$field-null-or-blank"
+                }
+
+                $invalidLock = (($validSourceLock | ConvertTo-Json -Depth 5) | ConvertFrom-Json)
+                $invalidLock.$sourceName.$field = $invalidRequiredValues[$field]
+                Set-Content -LiteralPath $sourceLockPath -Value ($invalidLock | ConvertTo-Json -Depth 5)
+                Invoke-ExpectedFailure { Read-SourceLock $sourceLockPath } "$sourceName-$field-invalid"
+            }
+        }
+
         Invoke-ExpectedFailure { Get-ArtifactRecord 'missing.obj|fixture|object|8664' $work $started 'negative' } 'missing'
         $empty = Join-Path $work 'empty.obj'
         [IO.File]::WriteAllBytes($empty, (New-Object byte[] 0))
@@ -726,6 +824,9 @@ function Invoke-SelfTest {
         $sourceRecord = Get-SourceRecord 'fixture' $metadata $source $overlay $work
         Assert-Condition ($sourceRecord.version -eq '1.0') 'Source identity positive test failed.'
         Assert-Condition ($sourceRecord.extractedFileCount -eq 2 -and $sourceRecord.appliedOverlayFileCount -eq 1) 'Source tree binding positive test failed.'
+        $blankVersionMetadata = $metadata.PSObject.Copy()
+        $blankVersionMetadata.version = ' '
+        Invoke-ExpectedFailure { Get-SourceRecord 'fixture' $blankVersionMetadata $source $overlay $work } 'blank-version-empty-identity-regex'
 
         $externalTree = Join-Path $work 'external-tree'
         New-Item -ItemType Directory -Path $externalTree | Out-Null
