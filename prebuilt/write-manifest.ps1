@@ -114,6 +114,54 @@ function Test-PathInside {
     return $fullPath.StartsWith($fullRoot, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+function Assert-ArchiveMembersSafe {
+    param([string]$TarPath, [string]$ArchivePath, [string]$ExtractionRoot)
+    $startInfo = New-Object Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $TarPath
+    $startInfo.Arguments = '-tf "' + $ArchivePath.Replace('"', '\"') + '"'
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $startInfo
+    try {
+        Assert-Condition $process.Start() "Unable to list archive members: $ArchivePath"
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $stdout = $stdoutTask.Result
+        $stderr = $stderrTask.Result
+        Assert-Condition ($process.ExitCode -eq 0) "Archive member listing failed: $stderr"
+        Assert-Condition ([string]::IsNullOrWhiteSpace($stderr)) "Archive member listing produced diagnostics: $stderr"
+    } finally {
+        $process.Dispose()
+    }
+
+    $listing = $stdout.TrimEnd("`r", "`n")
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($listing)) 'Archive contains no members.'
+    foreach ($member in @($listing -split "`r`n|`n|`r")) {
+        Assert-Condition (-not [string]::IsNullOrWhiteSpace($member)) 'Archive contains an empty or malformed member path.'
+        Assert-Condition ($member -notmatch '[\x00-\x1f\x7f]') "Archive member path contains control characters: $member"
+        Assert-Condition ($member -notmatch '^[\\/]') "Archive member path is absolute: $member"
+        Assert-Condition ($member -notmatch '^[A-Za-z]:') "Archive member path is drive-qualified: $member"
+        Assert-Condition ($member -notmatch ':') "Archive member path contains a Windows drive or stream qualifier: $member"
+        Assert-Condition ($member -notmatch '[\\/]{2}') "Archive member path contains an empty segment: $member"
+
+        $trimmedMember = $member.TrimEnd([char[]]@('\', '/'))
+        Assert-Condition (-not [string]::IsNullOrWhiteSpace($trimmedMember)) "Archive member path is malformed: $member"
+        $segments = @($trimmedMember -split '[\\/]')
+        Assert-Condition (-not ($segments | Where-Object { $_ -eq '' -or $_ -eq '.' -or $_ -eq '..' })) "Archive member path contains an unsafe segment: $member"
+
+        try {
+            $candidate = Get-FullPath (Join-Path $ExtractionRoot ($trimmedMember -replace '/', '\'))
+        } catch {
+            throw "Archive member path is malformed: $member"
+        }
+        Assert-Condition (Test-PathInside $candidate $ExtractionRoot) "Archive member path escapes extraction root: $member"
+    }
+}
+
 function Read-SourceLock {
     param([string]$Path)
     Assert-Condition (Test-Path -LiteralPath $Path -PathType Leaf) "Source lock does not exist: $Path"
@@ -211,6 +259,7 @@ function Get-SourceRecord {
     New-Item -ItemType Directory -Path $validation | Out-Null
     try {
         $tar = Get-Command tar.exe -ErrorAction Stop
+        Assert-ArchiveMembersSafe $tar.Source $archive $validation
         & $tar.Source -xf $archive -C $validation
         Assert-Condition ($LASTEXITCODE -eq 0) "$Name archive extraction failed."
         $lockedSource = Join-Path $validation ([string]$Metadata.extractedDirectory)
@@ -443,6 +492,14 @@ function Test-IsNative {
     return $native -in @('AMD64', 'x86_64')
 }
 
+function Get-ExecutionLimitation {
+    param([string]$Target, [string]$NativeArchitecture, [bool]$NativeExecution)
+    if ($NativeExecution) {
+        return 'Native tests were run by the selected Makefile check target.'
+    }
+    return "Target architecture $Target differs from host/native architecture $NativeArchitecture; native runtime tests were not run."
+}
+
 function Invoke-ExpectedFailure {
     param([scriptblock]$Action, [string]$Name)
     $failed = $false
@@ -455,6 +512,45 @@ function New-CoffObject {
     $bytes = New-Object byte[] 20
     [BitConverter]::GetBytes($Machine).CopyTo($bytes, 0)
     [IO.File]::WriteAllBytes($Path, $bytes)
+}
+
+function New-TestTarArchive {
+    param([string]$Path, [string]$MemberPath, [string]$Content)
+    $encoding = [Text.Encoding]::ASCII
+    $nameBytes = $encoding.GetBytes($MemberPath)
+    Assert-Condition ($nameBytes.Length -le 100) 'Self-test tar member name is too long.'
+    $contentBytes = $encoding.GetBytes($Content)
+    $header = New-Object byte[] 512
+    [Array]::Copy($nameBytes, 0, $header, 0, $nameBytes.Length)
+
+    foreach ($field in @(
+        @(100, 8, '0000644'),
+        @(108, 8, '0000000'),
+        @(116, 8, '0000000'),
+        @(124, 12, ([Convert]::ToString($contentBytes.Length, 8).PadLeft(11, '0'))),
+        @(136, 12, '00000000000')
+    )) {
+        $bytes = $encoding.GetBytes(([string]$field[2]) + [char]0)
+        [Array]::Copy($bytes, 0, $header, [int]$field[0], [Math]::Min($bytes.Length, [int]$field[1]))
+    }
+    for ($index = 148; $index -lt 156; $index++) { $header[$index] = 0x20 }
+    $header[156] = [byte][char]'0'
+    [Array]::Copy($encoding.GetBytes("ustar" + [char]0 + '00'), 0, $header, 257, 8)
+    $checksum = 0
+    foreach ($value in $header) { $checksum += $value }
+    $checksumBytes = $encoding.GetBytes(([Convert]::ToString($checksum, 8).PadLeft(6, '0')) + [char]0 + ' ')
+    [Array]::Copy($checksumBytes, 0, $header, 148, 8)
+
+    $stream = [IO.File]::Create($Path)
+    try {
+        $stream.Write($header, 0, $header.Length)
+        $stream.Write($contentBytes, 0, $contentBytes.Length)
+        $padding = (512 - ($contentBytes.Length % 512)) % 512
+        if ($padding -gt 0) { $stream.Write((New-Object byte[] $padding), 0, $padding) }
+        $stream.Write((New-Object byte[] 1024), 0, 1024)
+    } finally {
+        $stream.Dispose()
+    }
 }
 
 function Invoke-SelfTest {
@@ -471,6 +567,9 @@ function Invoke-SelfTest {
         $armRecord = Get-ArtifactRecord 'arm64.obj|fixture|object|AA64' $work $started 'self-test'
         Assert-Condition ($x64Record.machine -eq '8664') 'x64 machine detection failed.'
         Assert-Condition ($armRecord.machine -eq 'AA64') 'Arm64 machine detection failed.'
+        Assert-Condition ((Get-ExecutionLimitation 'x64' 'ARM64' $false) -ceq 'Target architecture x64 differs from host/native architecture ARM64; native runtime tests were not run.') 'x64 non-native limitation text is inaccurate.'
+        Assert-Condition ((Get-ExecutionLimitation 'arm64' 'AMD64' $false) -ceq 'Target architecture arm64 differs from host/native architecture AMD64; native runtime tests were not run.') 'Arm64 non-native limitation text is inaccurate.'
+        Assert-Condition ((Get-ExecutionLimitation 'x64' 'AMD64' $true) -ceq 'Native tests were run by the selected Makefile check target.') 'Native limitation text changed unexpectedly.'
 
         Invoke-ExpectedFailure { Get-ArtifactRecord 'missing.obj|fixture|object|8664' $work $started 'negative' } 'missing'
         $empty = Join-Path $work 'empty.obj'
@@ -516,6 +615,31 @@ function Invoke-SelfTest {
         $sourceRecord = Get-SourceRecord 'fixture' $metadata $source $overlay $work
         Assert-Condition ($sourceRecord.version -eq '1.0') 'Source identity positive test failed.'
         Assert-Condition ($sourceRecord.extractedFileCount -eq 2 -and $sourceRecord.appliedOverlayFileCount -eq 1) 'Source tree binding positive test failed.'
+
+        $maliciousMembers = @(
+            '../archive-escape.txt',
+            '..\archive-escape.txt',
+            '/absolute/archive-escape.txt',
+            '\absolute\archive-escape.txt',
+            'C:/archive-escape.txt',
+            'C:\archive-escape.txt',
+            'C:archive-escape.txt',
+            'sample-1.0//malformed.txt'
+        )
+        foreach ($maliciousMember in $maliciousMembers) {
+            $maliciousArchive = Join-Path $sourceParent ('malicious-' + [guid]::NewGuid().ToString('N') + '.tar')
+            New-TestTarArchive $maliciousArchive $maliciousMember 'must not be extracted'
+            Invoke-ExpectedFailure { Assert-ArchiveMembersSafe $tar.Source $maliciousArchive $work } "unsafe-archive-member-$maliciousMember"
+        }
+        $escapePath = Join-Path $work 'archive-escape.txt'
+        $traversalArchive = Join-Path $sourceParent 'malicious-traversal.tar'
+        New-TestTarArchive $traversalArchive '../archive-escape.txt' 'must not be extracted'
+        $traversalMetadata = $metadata.PSObject.Copy()
+        $traversalMetadata.archive = Split-Path -Leaf $traversalArchive
+        $traversalMetadata.sha512 = Get-FileDigest $traversalArchive SHA512
+        Invoke-ExpectedFailure { Get-SourceRecord 'fixture' $traversalMetadata $source $overlay $work } 'unsafe-archive-rejected-before-extraction'
+        Assert-Condition (-not (Test-Path -LiteralPath $escapePath)) 'Unsafe archive member was extracted before validation.'
+
         Invoke-ExpectedFailure { Get-SourceRecord 'fixture' $metadata (Join-Path $sourceParent 'missing-1.0') $overlay $work } 'missing-source'
         $wrongDirectoryMetadata = $metadata.PSObject.Copy()
         $wrongDirectoryMetadata.extractedDirectory = 'sample-2.0'
@@ -666,6 +790,7 @@ try {
     $commands = Get-CommandRecords $CommandLog $root $RunStartUtc
     Assert-Condition (-not ($commands | Where-Object { $_.exitCode -ne 0 })) 'A successful manifest cannot include a failed command.'
 
+    $nativeArchitecture = $(if ([string]::IsNullOrWhiteSpace([string]$env:PROCESSOR_ARCHITEW6432)) { [string]$env:PROCESSOR_ARCHITECTURE } else { [string]$env:PROCESSOR_ARCHITEW6432 })
     $native = Test-IsNative $Architecture
     $assemblerRequired = $Entry -match 'assembly' -and $Entry -notmatch 'noassembly'
     $libraries = @()
@@ -695,7 +820,7 @@ try {
         environment = [ordered]@{
             os = [Environment]::OSVersion.VersionString
             processArchitecture = [string]$env:PROCESSOR_ARCHITECTURE
-            nativeArchitecture = $(if ([string]::IsNullOrWhiteSpace([string]$env:PROCESSOR_ARCHITEW6432)) { [string]$env:PROCESSOR_ARCHITECTURE } else { [string]$env:PROCESSOR_ARCHITEW6432 })
+            nativeArchitecture = $nativeArchitecture
             tools = @(
                 (Get-ToolRecord 'cl.exe' $true),
                 (Get-ToolRecord 'link.exe' $true),
@@ -710,7 +835,7 @@ try {
         limitations = @(
             'Existing checked-in prebuilt binaries are unverified and are not certified by this manifest.',
             'FULL_64BIT= is GMP-only and is incompatible with MPFR.',
-            $(if ($native) { 'Native tests were run by the selected Makefile check target.' } else { 'Arm64 artifacts were cross-built; native runtime tests were not run.' })
+            (Get-ExecutionLimitation $Architecture $nativeArchitecture $native)
         )
     }
 
