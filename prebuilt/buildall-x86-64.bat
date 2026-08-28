@@ -3,6 +3,7 @@ SETLOCAL EnableExtensions DisableDelayedExpansion
 SET "NoDefaultCurrentDirectoryInExePath=1"
 
 SET "SCRIPT_ROOT=%~dp0"
+SET "SCRIPT_FILE=%~f0"
 SET "POWERSHELL_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 IF DEFINED PROCESSOR_ARCHITEW6432 SET "POWERSHELL_EXE=%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
 IF NOT EXIST "%POWERSHELL_EXE%" (
@@ -30,9 +31,6 @@ SET "MPFR_GMP_SOURCE=%GMP_SOURCE%"
 SET "NATIVE_OS_ARCH="
 SET "TEST_TARGET="
 
-FOR /F %%I IN ('%POWERSHELL_EXE% -NoProfile -Command "[DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')"') DO SET "RUN_ID=x64-%%I"
-FOR /F %%I IN ('%POWERSHELL_EXE% -NoProfile -Command "[DateTime]::UtcNow.ToString('o')"') DO SET "RUN_START=%%I"
-
 :PARSE_ARGS
 IF "%~1"=="" GOTO ARGS_DONE
 IF /I "%~1"=="--gmp-source" (
@@ -55,11 +53,7 @@ IF /I "%~1"=="--entry" (
   SET "SELECTED_ENTRY=%~2"
   SHIFT & SHIFT & GOTO PARSE_ARGS
 )
-IF /I "%~1"=="--arch" (
-  IF "%~2"=="" GOTO USAGE
-  SET "ARCH_VALUE=%~2"
-  SHIFT & SHIFT & GOTO PARSE_ARGS
-)
+IF /I "%~1"=="--arch" GOTO PARSE_ARCH
 IF /I "%~1"=="--allow-dirty-overlay" (
   SET "ALLOW_DIRTY=-AllowDirtyOverlay"
   SHIFT & GOTO PARSE_ARGS
@@ -70,7 +64,17 @@ IF /I "%~1"=="--self-test-fail-fast" (
 )
 GOTO USAGE
 
+:PARSE_ARCH
+SHIFT
+SET "ARCH_VALUE=%~1"
+SHIFT
+GOTO PARSE_ARGS
+
 :ARGS_DONE
+CALL :VALIDATE_ARCH
+IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
+FOR /F %%I IN ('%POWERSHELL_EXE% -NoProfile -Command "[DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')"') DO SET "RUN_ID=x64-%%I"
+FOR /F %%I IN ('%POWERSHELL_EXE% -NoProfile -Command "[DateTime]::UtcNow.ToString('o')"') DO SET "RUN_START=%%I"
 IF NOT DEFINED OUTPUT_ROOT SET "OUTPUT_ROOT=%SCRIPT_ROOT%..\..\win64-gmp-mpfr-runs\%RUN_ID%"
 CALL :DETECT_NATIVE_OS_ARCH
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
@@ -393,6 +397,15 @@ IF /I "%~1"=="AMD64" SET "TEST_TARGET=check"
 SET "RUN_RC=0"
 EXIT /B 0
 
+:VALIDATE_ARCH
+SETLOCAL DisableDelayedExpansion
+"%POWERSHELL_EXE%" -NoProfile -Command "$v=$env:ARCH_VALUE; if($null -ne $v -and $v -cmatch '\A[A-Za-z0-9_-]{1,32}\z'){exit 0}; exit 89" >NUL 2>&1
+IF NOT ERRORLEVEL 1 (
+  ENDLOCAL & SET "RUN_RC=0" & EXIT /B 0
+)
+ECHO ERROR: --arch must be 1-32 ASCII letters, digits, underscores, or hyphens.
+ENDLOCAL & SET "RUN_RC=89" & EXIT /B 89
+
 :RUN_SUBST_CREATE
 SETLOCAL DisableDelayedExpansion
 CALL :RUN subst %GMP_ALIAS_DRIVE% "%GMP_SOURCE%"
@@ -554,6 +567,49 @@ IF DEFINED TEST_TARGET (
   SET "RUN_RC=96"
   GOTO SELF_TEST_DONE
 )
+SET "ARCH_VALUE=AVX2"
+CALL :VALIDATE_ARCH
+IF NOT "%RUN_RC%"=="0" (
+  SET "RUN_RC=109"
+  GOTO SELF_TEST_DONE
+)
+SET "ARCH_VALUE=AVX512"
+CALL :VALIDATE_ARCH
+IF NOT "%RUN_RC%"=="0" (
+  SET "RUN_RC=110"
+  GOTO SELF_TEST_DONE
+)
+SET "ARCH_VALUE=AVX 2"
+CALL :VALIDATE_ARCH
+IF NOT "%RUN_RC%"=="89" (
+  SET "RUN_RC=111"
+  GOTO SELF_TEST_DONE
+)
+SET "ARCH_VALUE=AVX2/../../bad"
+CALL :VALIDATE_ARCH
+IF NOT "%RUN_RC%"=="89" (
+  SET "RUN_RC=112"
+  GOTO SELF_TEST_DONE
+)
+CD /D "%BANG_DIR%"
+CALL "%SCRIPT_FILE%" --arch "AVX2&echo injected>arch-injection-amp.marker" --self-test-fail-fast >NUL 2>&1
+IF NOT "%ERRORLEVEL%"=="89" (
+  SET "RUN_RC=113"
+  GOTO SELF_TEST_DONE
+)
+IF EXIST "arch-injection-amp.marker" (
+  SET "RUN_RC=114"
+  GOTO SELF_TEST_DONE
+)
+CALL "%SCRIPT_FILE%" --arch "AVX512|echo injected>arch-injection-pipe.marker" --self-test-fail-fast >NUL 2>&1
+IF NOT "%ERRORLEVEL%"=="89" (
+  SET "RUN_RC=115"
+  GOTO SELF_TEST_DONE
+)
+IF EXIST "arch-injection-pipe.marker" (
+  SET "RUN_RC=116"
+  GOTO SELF_TEST_DONE
+)
 CALL :RUN cmd /d /c exit 37
 SET "SAVED_RC=%RUN_RC%"
 IF "%SAVED_RC%"=="0" SET "SAVED_RC=99"
@@ -576,5 +632,6 @@ EXIT /B %SAVED_RC%
 
 :USAGE
 ECHO Usage: %~nx0 [--gmp-source DIR] [--mpfr-source DIR] [--output EMPTY_DIR] [--entry NAME] [--arch AVX2] [--allow-dirty-overlay]
+ECHO        --arch accepts 1-32 ASCII letters, digits, underscores, or hyphens; invalid values exit 89.
 ECHO        %~nx0 --self-test-fail-fast
 EXIT /B 64
