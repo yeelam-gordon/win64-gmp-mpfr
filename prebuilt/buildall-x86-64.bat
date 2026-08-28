@@ -408,13 +408,15 @@ ENDLOCAL & EXIT /B 0
 :RUN_NMAKE
 SETLOCAL DisableDelayedExpansion
 SET "NMAKE_EXE="
-FOR %%I IN (nmake.exe nmake.com nmake.bat nmake.cmd) DO IF NOT DEFINED NMAKE_EXE SET "NMAKE_EXE=%%~$PATH:I"
+FOR %%I IN (nmake.exe) DO SET "NMAKE_EXE=%%~$PATH:I"
 IF NOT DEFINED NMAKE_EXE GOTO RUN_NMAKE_MISSING
+FOR %%I IN ("%NMAKE_EXE%") DO IF /I NOT "%%~fI"=="%NMAKE_EXE%" GOTO RUN_NMAKE_MISSING
 SET "PATH=%PATH%;%CD%"
 CALL :RUN "%NMAKE_EXE%" %*
 GOTO RUN_NMAKE_DONE
 :RUN_NMAKE_MISSING
-CALL :RUN nmake %*
+ECHO ERROR: trusted nmake.exe was not found as an absolute path on PATH.
+SET "RUN_RC=104"
 :RUN_NMAKE_DONE
 SET "RC=%RUN_RC%"
 SET "RUN_CWD=%CD%"
@@ -443,10 +445,16 @@ SETLOCAL DisableDelayedExpansion
 SET "OUTPUT_ROOT=%SCRIPT_ROOT%.test-work\fail-fast-%RUN_ID%"
 SET "BANG_DIR=%OUTPUT_ROOT%\literal!"
 SET "TRUSTED_TOOL_DIR=%OUTPUT_ROOT%\trusted tools"
+SET "WRAPPER_TOOL_DIR=%OUTPUT_ROOT%\wrapper tools"
+SET "EMPTY_TOOL_DIR=%OUTPUT_ROOT%\empty tools"
 IF EXIST "%OUTPUT_ROOT%" RMDIR /S /Q "%OUTPUT_ROOT%"
 MKDIR "%OUTPUT_ROOT%\logs"
 IF ERRORLEVEL 1 EXIT /B %ERRORLEVEL%
 MKDIR "%TRUSTED_TOOL_DIR%"
+IF ERRORLEVEL 1 EXIT /B %ERRORLEVEL%
+MKDIR "%WRAPPER_TOOL_DIR%"
+IF ERRORLEVEL 1 EXIT /B %ERRORLEVEL%
+MKDIR "%EMPTY_TOOL_DIR%"
 IF ERRORLEVEL 1 EXIT /B %ERRORLEVEL%
 SET "COMMAND_LOG=%OUTPUT_ROOT%\commands.tsv"
 SET "LOG_ROOT=%OUTPUT_ROOT%\logs"
@@ -473,9 +481,16 @@ IF ERRORLEVEL 1 (
   SET "RUN_RC=103"
   GOTO SELF_TEST_DONE
 )
+COPY /Y "%SystemRoot%\System32\where.exe" "%WRAPPER_TOOL_DIR%\nmake.com" >NUL
+IF ERRORLEVEL 1 (
+  SET "RUN_RC=105"
+  GOTO SELF_TEST_DONE
+)
+>"%WRAPPER_TOOL_DIR%\nmake.bat" ECHO @ECHO wrapper^>"%OUTPUT_ROOT%\wrapper.marker"
+>"%WRAPPER_TOOL_DIR%\nmake.cmd" ECHO @ECHO wrapper^>"%OUTPUT_ROOT%\wrapper.marker"
 >"%BANG_DIR%\colored_print.cmd" ECHO @ECHO helper^>"%OUTPUT_ROOT%\helper.marker"
 >>"%BANG_DIR%\colored_print.cmd" ECHO @ECHO trusted^>"%OUTPUT_ROOT%\trusted-nmake.marker"
-SET "PATH=%TRUSTED_TOOL_DIR%;%PATH%"
+SET "PATH=%WRAPPER_TOOL_DIR%;%TRUSTED_TOOL_DIR%;%PATH%"
 CALL :RUN CD /D "%BANG_DIR%"
 IF NOT "%RUN_RC%"=="0" GOTO SELF_TEST_DONE
 CALL :RUN cmd /d /c cd
@@ -497,6 +512,23 @@ IF NOT EXIST "%OUTPUT_ROOT%\helper.marker" (
   SET "RUN_RC=102"
   GOTO SELF_TEST_DONE
 )
+SET "PATH=%WRAPPER_TOOL_DIR%"
+CALL :RUN_NMAKE /d /c colored_print
+IF NOT "%RUN_RC%"=="104" (
+  SET "RUN_RC=106"
+  GOTO SELF_TEST_DONE
+)
+IF EXIST "%OUTPUT_ROOT%\wrapper.marker" (
+  SET "RUN_RC=107"
+  GOTO SELF_TEST_DONE
+)
+SET "PATH=%EMPTY_TOOL_DIR%"
+CALL :RUN_NMAKE /d /c colored_print
+IF NOT "%RUN_RC%"=="104" (
+  SET "RUN_RC=108"
+  GOTO SELF_TEST_DONE
+)
+SET "PATH=%PATH_BEFORE_NMAKE%"
 "%POWERSHELL_EXE%" -NoProfile -Command "$lines=[IO.File]::ReadAllLines($env:COMMAND_LOG); $logs=@($lines|%%{($_ -split '\|')[5]}|Select-Object -Unique); if($lines.Count -ne 5 -or $logs.Count -ne 5 -or -not (($lines -join [Environment]::NewLine).Contains($env:BANG_DIR))){exit 1}"
 IF ERRORLEVEL 1 (
   SET "RUN_RC=91"

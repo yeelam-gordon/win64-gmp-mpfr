@@ -97,6 +97,21 @@ function Remove-TestDirectoryReparsePoint {
     Assert-Condition ($null -eq (Get-Item -LiteralPath $fullPath -Force -ErrorAction SilentlyContinue)) "Unable to remove directory reparse fixture: $fullPath"
 }
 
+function Remove-TestFileReparsePoint {
+    param([string]$Path, [string]$ExpectedParent)
+
+    $fullPath = Get-FullPath $Path
+    $fullExpectedParent = (Get-FullPath $ExpectedParent).TrimEnd('\')
+    Assert-Condition ([string]::Equals((Split-Path -Parent $fullPath).TrimEnd('\'), $fullExpectedParent, [StringComparison]::OrdinalIgnoreCase)) "Refusing to remove a reparse fixture outside its expected parent: $fullPath"
+
+    $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction SilentlyContinue
+    Assert-Condition ($null -ne $item -and -not $item.PSIsContainer) "File reparse fixture is missing: $fullPath"
+    Assert-Condition ([bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) "Refusing to remove a non-reparse fixture: $fullPath"
+
+    [IO.File]::Delete($fullPath)
+    Assert-Condition ($null -eq (Get-Item -LiteralPath $fullPath -Force -ErrorAction SilentlyContinue)) "Unable to remove file reparse fixture: $fullPath"
+}
+
 function Get-FileDigest {
     param([string]$Path, [ValidateSet('SHA256', 'SHA512')][string]$Algorithm)
     $hasher = [Security.Cryptography.HashAlgorithm]::Create($Algorithm)
@@ -127,6 +142,27 @@ function Test-PathInside {
     $fullPath = Get-FullPath $Path
     $fullRoot = (Get-FullPath $Root).TrimEnd('\') + '\'
     return $fullPath.StartsWith($fullRoot, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-TreeFilesFailClosed {
+    param([string]$Root, [string]$TreeName)
+
+    $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction SilentlyContinue
+    Assert-Condition ($null -ne $rootItem -and $rootItem.PSIsContainer) "$TreeName tree is missing: $Root"
+    Assert-Condition (-not ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) "$TreeName tree contains a reparse point: $($rootItem.FullName)"
+
+    $pending = New-Object 'Collections.Generic.Stack[string]'
+    $pending.Push($rootItem.FullName)
+    while ($pending.Count -gt 0) {
+        foreach ($item in Get-ChildItem -LiteralPath $pending.Pop() -Force) {
+            Assert-Condition (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) "$TreeName tree contains a reparse point: $($item.FullName)"
+            if ($item.PSIsContainer) {
+                $pending.Push($item.FullName)
+            } else {
+                $item
+            }
+        }
+    }
 }
 
 function Assert-ArchiveMembersSafe {
@@ -239,27 +275,6 @@ function Assert-TreeMatches {
         [string]$CandidateRoot,
         [string[]]$AllowedCandidatePrefixes = @()
     )
-    function Get-TreeFilesFailClosed {
-        param([string]$Root, [string]$TreeName)
-
-        $rootItem = Get-Item -LiteralPath $Root -Force -ErrorAction SilentlyContinue
-        Assert-Condition ($null -ne $rootItem -and $rootItem.PSIsContainer) "$TreeName tree is missing: $Root"
-        Assert-Condition (-not ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) "$TreeName tree contains a reparse point: $($rootItem.FullName)"
-
-        $pending = New-Object 'Collections.Generic.Stack[string]'
-        $pending.Push($rootItem.FullName)
-        while ($pending.Count -gt 0) {
-            foreach ($item in Get-ChildItem -LiteralPath $pending.Pop() -Force) {
-                Assert-Condition (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) "$TreeName tree contains a reparse point: $($item.FullName)"
-                if ($item.PSIsContainer) {
-                    $pending.Push($item.FullName)
-                } else {
-                    $item
-                }
-            }
-        }
-    }
-
     $referenceFiles = @{}
     foreach ($file in Get-TreeFilesFailClosed $ReferenceRoot 'Reference') {
         $relative = $file.FullName.Substring($ReferenceRoot.TrimEnd('\').Length + 1)
@@ -382,7 +397,7 @@ function Get-OverlayRecord {
     )) {
         $root = Join-Path $RepositoryRoot $overlayRoot.relativePath
         Assert-Condition (Test-Path -LiteralPath $root -PathType Container) "Required $($overlayRoot.name) overlay directory is missing: $root. Restore the overlay at '$($overlayRoot.relativePath)' before writing the manifest."
-        foreach ($file in Get-ChildItem -LiteralPath $root -File -Recurse | Sort-Object FullName) {
+        foreach ($file in Get-TreeFilesFailClosed $root "$($overlayRoot.name) overlay" | Sort-Object FullName) {
             $relative = $file.FullName.Substring($RepositoryRoot.TrimEnd('\').Length + 1)
             $files += [ordered]@{
                 path = $relative
@@ -553,15 +568,15 @@ function Get-CommandRecords {
 function Test-IsTrustedNMakeCommand {
     param([string]$Command)
     if ([string]::IsNullOrWhiteSpace($Command)) { return $false }
-    $executable = [regex]::Match(
-        $Command,
-        '^\s*(?:"(?<qualified>[^"]+)"|(?<bare>nmake(?:\.exe)?))(?=\s)',
-        [Text.RegularExpressions.RegexOptions]::IgnoreCase
-    )
+    $executable = [regex]::Match($Command, '^\s*(?:"(?<quoted>[^"]+)"|(?<unquoted>\S+))(?=\s|$)')
     if (-not $executable.Success) { return $false }
-    if ($executable.Groups['bare'].Success) { return $true }
-    $qualified = $executable.Groups['qualified'].Value
-    return [IO.Path]::IsPathRooted($qualified) -and ([IO.Path]::GetFileName($qualified) -ieq 'nmake.exe')
+    $path = $(if ($executable.Groups['quoted'].Success) {
+        $executable.Groups['quoted'].Value
+    } else {
+        $executable.Groups['unquoted'].Value
+    })
+    $isAbsoluteWindowsPath = $path -match '^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+\\)'
+    return $isAbsoluteWindowsPath -and ([IO.Path]::GetFileName($path) -ieq 'nmake.exe')
 }
 
 function Remove-AnsiTerminalControlSequences {
@@ -952,6 +967,87 @@ function Invoke-SelfTest {
             Set-Content -LiteralPath (Join-Path $missingOverlay.path 'Makefile') -Value "$($missingOverlay.name.ToLowerInvariant()) overlay"
         }
 
+        $externalOverlayRoot = Join-Path $work 'external-overlay-root'
+        New-Item -ItemType Directory -Path $externalOverlayRoot | Out-Null
+        Set-Content -LiteralPath (Join-Path $externalOverlayRoot 'external.mk') -Value 'must not be hashed'
+        foreach ($linkType in @('Junction', 'SymbolicLink')) {
+            $savedGmpOverlayRoot = Join-Path $overlayRepository "gmp-overlay-saved-$($linkType.ToLowerInvariant())"
+            Move-Item -LiteralPath $gmpOverlayRoot -Destination $savedGmpOverlayRoot
+            $rootLinkCreated = $false
+            try {
+                try {
+                    New-Item -ItemType $linkType -Path $gmpOverlayRoot -Target $externalOverlayRoot -ErrorAction Stop | Out-Null
+                    $rootLinkCreated = $true
+                } catch {
+                    if ($linkType -eq 'SymbolicLink') { continue }
+                    throw
+                }
+                $failureMessage = ''
+                try {
+                    Get-OverlayRecord $overlayRepository $true | Out-Null
+                } catch {
+                    $failureMessage = $_.Exception.Message
+                }
+                Assert-Condition (-not [string]::IsNullOrWhiteSpace($failureMessage)) "Self-test 'overlay-root-$($linkType.ToLowerInvariant())' did not fail closed."
+                Assert-Condition ($failureMessage.Contains($gmpOverlayRoot)) "Overlay root $linkType failure did not identify the offending path."
+            } finally {
+                if ($rootLinkCreated) {
+                    Remove-TestDirectoryReparsePoint $gmpOverlayRoot (Split-Path -Parent $gmpOverlayRoot)
+                }
+                Move-Item -LiteralPath $savedGmpOverlayRoot -Destination $gmpOverlayRoot
+            }
+            Assert-Condition (Test-Path -LiteralPath (Join-Path $externalOverlayRoot 'external.mk') -PathType Leaf) "Overlay root $linkType cleanup removed the external target."
+
+            $nestedLink = Join-Path $gmpOverlayRoot "external-$($linkType.ToLowerInvariant())"
+            try {
+                New-Item -ItemType $linkType -Path $nestedLink -Target $externalOverlayRoot -ErrorAction Stop | Out-Null
+            } catch {
+                if ($linkType -eq 'SymbolicLink') { continue }
+                throw
+            }
+            try {
+                $failureMessage = ''
+                try {
+                    Get-OverlayRecord $overlayRepository $true | Out-Null
+                } catch {
+                    $failureMessage = $_.Exception.Message
+                }
+                Assert-Condition (-not [string]::IsNullOrWhiteSpace($failureMessage)) "Self-test 'overlay-nested-directory-$($linkType.ToLowerInvariant())' did not fail closed."
+                Assert-Condition ($failureMessage.Contains($nestedLink)) "Overlay nested directory $linkType failure did not identify the offending path."
+            } finally {
+                Remove-TestDirectoryReparsePoint $nestedLink $gmpOverlayRoot
+            }
+            Assert-Condition (Test-Path -LiteralPath (Join-Path $externalOverlayRoot 'external.mk') -PathType Leaf) "Overlay nested directory $linkType cleanup removed the external target."
+        }
+
+        $externalOverlayFile = Join-Path $work 'external-overlay-file.mk'
+        Set-Content -LiteralPath $externalOverlayFile -Value 'must not be hashed'
+        $nestedFileLink = Join-Path $gmpOverlayRoot 'external-file-symlink.mk'
+        $fileLinkCreated = $false
+        try {
+            try {
+                New-Item -ItemType SymbolicLink -Path $nestedFileLink -Target $externalOverlayFile -ErrorAction Stop | Out-Null
+                $fileLinkCreated = $true
+            } catch {
+                $fileLinkCreated = $false
+            }
+            if ($fileLinkCreated) {
+                $failureMessage = ''
+                try {
+                    Get-OverlayRecord $overlayRepository $true | Out-Null
+                } catch {
+                    $failureMessage = $_.Exception.Message
+                }
+                Assert-Condition (-not [string]::IsNullOrWhiteSpace($failureMessage)) "Self-test 'overlay-nested-file-symboliclink' did not fail closed."
+                Assert-Condition ($failureMessage.Contains($nestedFileLink)) 'Overlay nested file symbolic link failure did not identify the offending path.'
+            }
+        } finally {
+            if ($fileLinkCreated) {
+                Remove-TestFileReparsePoint $nestedFileLink $gmpOverlayRoot
+            }
+        }
+        Assert-Condition (Test-Path -LiteralPath $externalOverlayFile -PathType Leaf) 'Overlay nested file symbolic link cleanup removed the external target.'
+
         $maliciousMembers = @(
             '../archive-escape.txt',
             '..\archive-escape.txt',
@@ -1014,7 +1110,21 @@ function Invoke-SelfTest {
         Set-Content -LiteralPath $evidenceLog -Value $passingLog
         Set-Content -LiteralPath $evidenceFile -Value ($evidenceLine -replace '"C:\\Program Files\\Microsoft Visual Studio\\VC\\Tools\\MSVC\\bin\\Hostx64\\x64\\nmake\.exe"', 'nmake')
         $bareEvidenceRecords = Get-CommandRecords $evidenceFile $evidenceRoot $started
-        Assert-NativeTestEvidence $bareEvidenceRecords 'gmp' 'entry' $evidenceRoot
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $bareEvidenceRecords 'gmp' 'entry' $evidenceRoot } 'bare-nmake-command'
+        Set-Content -LiteralPath $evidenceFile -Value ($evidenceLine -replace '"C:\\Program Files\\Microsoft Visual Studio\\VC\\Tools\\MSVC\\bin\\Hostx64\\x64\\nmake\.exe"', 'nmake.exe')
+        $bareExeEvidenceRecords = Get-CommandRecords $evidenceFile $evidenceRoot $started
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $bareExeEvidenceRecords 'gmp' 'entry' $evidenceRoot } 'bare-nmake-exe-command'
+        $unquotedEvidenceLine = $evidenceLine -replace '"C:\\Program Files\\Microsoft Visual Studio\\VC\\Tools\\MSVC\\bin\\Hostx64\\x64\\nmake\.exe"', 'C:\BuildTools\VC\bin\nmake.exe'
+        Set-Content -LiteralPath $evidenceFile -Value $unquotedEvidenceLine
+        $unquotedEvidenceRecords = Get-CommandRecords $evidenceFile $evidenceRoot $started
+        Assert-NativeTestEvidence $unquotedEvidenceRecords 'gmp' 'entry' $evidenceRoot
+        $wrapperEvidenceLine = $evidenceLine -replace '"C:\\Program Files\\Microsoft Visual Studio\\VC\\Tools\\MSVC\\bin\\Hostx64\\x64\\nmake\.exe"', '"C:\Windows\System32\cmd.exe" /c nmake.exe'
+        Set-Content -LiteralPath $evidenceFile -Value $wrapperEvidenceLine
+        $wrapperEvidenceRecords = Get-CommandRecords $evidenceFile $evidenceRoot $started
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $wrapperEvidenceRecords 'gmp' 'entry' $evidenceRoot } 'wrapped-nmake-command'
+        Set-Content -LiteralPath $evidenceFile -Value ($evidenceLine -replace '"C:\\Program Files\\Microsoft Visual Studio\\VC\\Tools\\MSVC\\bin\\Hostx64\\x64\\nmake\.exe"', 'C:\BuildTools\VC\bin\nmake.cmd')
+        $nmakeCmdEvidenceRecords = Get-CommandRecords $evidenceFile $evidenceRoot $started
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $nmakeCmdEvidenceRecords 'gmp' 'entry' $evidenceRoot } 'nmake-wrapper-command'
         Set-Content -LiteralPath $evidenceFile -Value $evidenceLine
         $evidenceRecords = Get-CommandRecords $evidenceFile $evidenceRoot $started
         Set-Content -LiteralPath $evidenceLog -Value 'fabricated output without a test result'

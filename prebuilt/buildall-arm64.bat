@@ -394,10 +394,19 @@ ENDLOCAL & EXIT /B 0
 
 :RUN_NMAKE
 SETLOCAL DisableDelayedExpansion
+SET "NMAKE_EXE="
+FOR %%I IN (nmake.exe) DO SET "NMAKE_EXE=%%~$PATH:I"
+IF NOT DEFINED NMAKE_EXE (
+  ECHO ERROR: trusted nmake.exe was not found on PATH.
+  SET "RC=69"
+  SET "RUN_CWD=%CD%"
+  GOTO RUN_NMAKE_DONE
+)
 SET "PATH=%PATH%;%CD%"
-CALL :RUN nmake %*
+CALL :RUN "%NMAKE_EXE%" %*
 SET "RC=%RUN_RC%"
 SET "RUN_CWD=%CD%"
+:RUN_NMAKE_DONE
 ENDLOCAL & CD /D "%RUN_CWD%" >NUL & SET "COMMAND_INDEX=%COMMAND_INDEX%" & SET "RUN_RC=%RC%" & SET "RUN_ACTION=" & SET "RUN_LIBRARY=" & EXIT /B %RC%
 
 :RUN
@@ -472,6 +481,20 @@ IF ERRORLEVEL 1 (
   SET "RUN_RC=98"
   GOTO SELF_TEST_DONE
 )
+SET "PATH_BEFORE_MISSING_NMAKE=%PATH%"
+SET "PATH=%OUTPUT_ROOT%"
+CALL :RUN_NMAKE /D /C "ECHO spoof-ran>missing-nmake-spoof.marker"
+SET "MISSING_NMAKE_RC=%RUN_RC%"
+SET "PATH=%PATH_BEFORE_MISSING_NMAKE%"
+IF NOT "%MISSING_NMAKE_RC%"=="69" (
+  SET "RUN_RC=104"
+  GOTO SELF_TEST_DONE
+)
+IF EXIST "%TEST_BUILD_DIR%\missing-nmake-spoof.marker" (
+  SET "RUN_RC=105"
+  GOTO SELF_TEST_DONE
+)
+SET "RUN_RC=0"
 "%POWERSHELL_EXE%" -NoProfile -Command "$lines=[IO.File]::ReadAllLines($env:COMMAND_LOG); $logs=@($lines|%%{($_ -split '\|')[5]}|Select-Object -Unique); if($lines.Count -ne 5 -or $logs.Count -ne 5 -or -not (($lines -join [Environment]::NewLine).Contains($env:BANG_DIR))){exit 1}"
 IF ERRORLEVEL 1 (
   SET "RUN_RC=91"
