@@ -550,6 +550,26 @@ function Get-CommandRecords {
     return $records
 }
 
+function Test-IsTrustedNMakeCommand {
+    param([string]$Command)
+    if ([string]::IsNullOrWhiteSpace($Command)) { return $false }
+    $executable = [regex]::Match(
+        $Command,
+        '^\s*(?:"(?<qualified>[^"]+)"|(?<bare>nmake(?:\.exe)?))(?=\s)',
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+    if (-not $executable.Success) { return $false }
+    if ($executable.Groups['bare'].Success) { return $true }
+    $qualified = $executable.Groups['qualified'].Value
+    return [IO.Path]::IsPathRooted($qualified) -and ([IO.Path]::GetFileName($qualified) -ieq 'nmake.exe')
+}
+
+function Remove-AnsiTerminalControlSequences {
+    param([string]$Text)
+    if ($null -eq $Text) { return $null }
+    return [regex]::Replace($Text, '(?:\x1B\[|\x9B)[0-?]*[ -/]*[@-~]', ' ')
+}
+
 function Assert-NativeTestEvidence {
     param($Records, [string]$Library, [string]$CurrentEntry, [string]$Root)
     $matches = @($Records | Where-Object {
@@ -557,14 +577,38 @@ function Assert-NativeTestEvidence {
         $_.action -ceq 'build-check' -and
         $_.library -ceq $Library -and
         $_.exitCode -eq 0 -and
-        $_.command -match '(?i)^nmake(?:\.exe)?\s' -and
+        (Test-IsTrustedNMakeCommand $_.command) -and
         $_.command -match '(?i)(?:^|\s)check(?:\s|$)'
     })
     Assert-Condition ($matches.Count -eq 1) "Exactly one successful structured check record is required for $Library in entry '$CurrentEntry'."
     $logPath = Get-FullPath (Join-Path $Root $matches[0].log)
     Assert-Condition ((Get-Item -LiteralPath $logPath).Length -gt 0) "Check log is empty for $Library."
     $logText = Get-Content -LiteralPath $logPath -Raw
-    Assert-Condition ($logText -match '(?im)\bPASS(?:ED)?\b') "Check log does not contain passing test evidence for $Library."
+    $parsedLogText = Remove-AnsiTerminalControlSequences $logText
+    Assert-Condition ($parsedLogText -match '(?im)\bPASS(?:ED)?\b') "Check log does not contain passing test evidence for $Library."
+    $summaryLines = @($parsedLogText -split "\r?\n" | Where-Object {
+        $_ -match '(?i)\boverall\b' -and
+        $_ -match '(?i)\bsucceeded\b' -and
+        $_ -match '(?i)\bfailed\b' -and
+        $_ -match '(?i)\bskipped\b'
+    })
+    Assert-Condition ($summaryLines.Count -eq 1) "Exactly one test-suite summary is required for $Library."
+    $summary = [regex]::Match(
+        $summaryLines[0],
+        '^\s*(?<overall>\d+)\s+overall\s*,\s*(?<succeeded>\d+)\s+succeeded\s*,\s*(?<failed>\d+)\s+failed\s*,\s*(?<skipped>\d+)\s+skipped\s*\.\s*$',
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+    Assert-Condition ($summary.Success) "Malformed test-suite summary for $Library."
+    $counts = @{}
+    foreach ($name in @('overall', 'succeeded', 'failed', 'skipped')) {
+        $value = 0L
+        Assert-Condition ([long]::TryParse($summary.Groups[$name].Value, [ref]$value)) "Invalid $name test count for $Library."
+        Assert-Condition ($value -ge 0) "Negative $name test count for $Library."
+        $counts[$name] = $value
+    }
+    Assert-Condition ([decimal]$counts.overall -eq ([decimal]$counts.succeeded + [decimal]$counts.failed + [decimal]$counts.skipped)) "Inconsistent test-suite summary for $Library."
+    Assert-Condition ($counts.succeeded -gt 0) "Test-suite summary reports no successful tests for $Library."
+    Assert-Condition ($counts.failed -eq 0) "Test-suite summary reports failed tests for $Library."
 }
 
 function ConvertTo-SupportedArchitecture {
@@ -638,9 +682,16 @@ function Format-ErrorRecordDiagnostic {
 }
 
 function Invoke-ExpectedFailure {
-    param([scriptblock]$Action, [string]$Name)
+    param([scriptblock]$Action, [string]$Name, [string]$ExpectedMessage)
     $failed = $false
-    try { & $Action } catch { $failed = $true }
+    try {
+        & $Action
+    } catch {
+        $failed = $true
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedMessage)) {
+            Assert-Condition $_.Exception.Message.Contains($ExpectedMessage) "Self-test '$Name' failed for the wrong reason: $($_.Exception.Message)"
+        }
+    }
     Assert-Condition $failed "Self-test '$Name' did not fail closed."
 }
 
@@ -942,19 +993,57 @@ function Invoke-SelfTest {
         $evidenceRoot = Join-Path $work 'evidence'
         New-Item -ItemType Directory -Path (Join-Path $evidenceRoot 'logs') | Out-Null
         $evidenceLog = Join-Path $evidenceRoot 'logs\check.log'
-        Set-Content -LiteralPath $evidenceLog -Value 'Running test fixture ... PASS'
-        $evidenceLine = "{0}|entry|build-check|gmp|0|logs\check.log|nmake /f win64\Makefile static_lib check" -f [datetime]::UtcNow.ToString('o')
+        $passingLog = @('Running test fixture ... PASS', '2 overall, 1 succeeded, 0 failed, 1 skipped.')
+        Set-Content -LiteralPath $evidenceLog -Value $passingLog
+        $evidenceLine = '{0}|entry|build-check|gmp|0|logs\check.log|"C:\Program Files\Microsoft Visual Studio\VC\Tools\MSVC\bin\Hostx64\x64\nmake.exe" /f win64\Makefile static_lib check' -f [datetime]::UtcNow.ToString('o')
         $evidenceFile = Join-Path $evidenceRoot 'commands.tsv'
         Set-Content -LiteralPath $evidenceFile -Value $evidenceLine
         $evidenceRecords = Get-CommandRecords $evidenceFile $evidenceRoot $started
         Assert-NativeTestEvidence $evidenceRecords 'gmp' 'entry' $evidenceRoot
+        $escape = [char]0x1b
+        Set-Content -LiteralPath $evidenceLog -Value @(
+            "${escape}[1;32mRunning test fixture ... PASS${escape}[0m",
+            "${escape}[1;33m2${escape}[1;36m overall, ${escape}[1;32m1${escape}[1;36m succeeded, ${escape}[1;31m0${escape}[1;36m failed, ${escape}[1;33m1${escape}[1;36m skipped${escape}[0;0;0m."
+        )
+        Assert-NativeTestEvidence $evidenceRecords 'gmp' 'entry' $evidenceRoot
+        Set-Content -LiteralPath $evidenceLog -Value @(
+            "${escape}[1;32mRunning test fixture ... PASS${escape}[0m",
+            "${escape}[1;33m2${escape}[1;36m overall, ${escape}[1;32m1${escape}[1;36m succeeded, ${escape}[1;31m1${escape}[1;36m failed, ${escape}[1;33m0${escape}[1;36m skipped${escape}[0;0;0m."
+        )
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $evidenceRecords 'gmp' 'entry' $evidenceRoot } 'colored-failed-check-summary' 'Test-suite summary reports failed tests for gmp.'
+        Set-Content -LiteralPath $evidenceLog -Value $passingLog
+        Set-Content -LiteralPath $evidenceFile -Value ($evidenceLine -replace '"C:\\Program Files\\Microsoft Visual Studio\\VC\\Tools\\MSVC\\bin\\Hostx64\\x64\\nmake\.exe"', 'nmake')
+        $bareEvidenceRecords = Get-CommandRecords $evidenceFile $evidenceRoot $started
+        Assert-NativeTestEvidence $bareEvidenceRecords 'gmp' 'entry' $evidenceRoot
+        Set-Content -LiteralPath $evidenceFile -Value $evidenceLine
+        $evidenceRecords = Get-CommandRecords $evidenceFile $evidenceRoot $started
         Set-Content -LiteralPath $evidenceLog -Value 'fabricated output without a test result'
         Invoke-ExpectedFailure { Assert-NativeTestEvidence $evidenceRecords 'gmp' 'entry' $evidenceRoot } 'fake-check-log'
+        Set-Content -LiteralPath $evidenceLog -Value @('Running test fixture ... PASS', '2 overall, 1 succeeded, 1 failed, 0 skipped.')
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $evidenceRecords 'gmp' 'entry' $evidenceRoot } 'failed-check-summary'
         Set-Content -LiteralPath $evidenceLog -Value 'Running test fixture ... PASS'
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $evidenceRecords 'gmp' 'entry' $evidenceRoot } 'missing-check-summary'
+        Set-Content -LiteralPath $evidenceLog -Value @('Running test fixture ... PASS', '1 overall, 1 succeeded, 0 failed, 0 skipped.', '2 overall, 2 succeeded, 0 failed, 0 skipped.')
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $evidenceRecords 'gmp' 'entry' $evidenceRoot } 'multiple-check-summaries'
+        Set-Content -LiteralPath $evidenceLog -Value @('Running test fixture ... PASS', '1 overall; 1 succeeded; 0 failed; 0 skipped')
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $evidenceRecords 'gmp' 'entry' $evidenceRoot } 'malformed-check-summary'
+        Set-Content -LiteralPath $evidenceLog -Value @('Running test fixture ... PASS', '3 overall, 1 succeeded, 0 failed, 1 skipped.')
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $evidenceRecords 'gmp' 'entry' $evidenceRoot } 'inconsistent-check-summary'
+        Set-Content -LiteralPath $evidenceLog -Value @('Running test fixture ... PASS', '1 overall, 0 succeeded, 0 failed, 1 skipped.')
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $evidenceRecords 'gmp' 'entry' $evidenceRoot } 'zero-success-check-summary'
+        Set-Content -LiteralPath $evidenceLog -Value @('Running test fixture ... PASS', '-1 overall, 1 succeeded, 0 failed, 0 skipped.')
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $evidenceRecords 'gmp' 'entry' $evidenceRoot } 'negative-check-summary'
+        Set-Content -LiteralPath $evidenceLog -Value $passingLog
         Invoke-ExpectedFailure { Assert-NativeTestEvidence $evidenceRecords 'mpfr' 'entry' $evidenceRoot } 'mismatched-check-library'
         Set-Content -LiteralPath $evidenceFile -Value ($evidenceLine -replace '\|build-check\|', '|build-link|')
         $mismatchedRecords = Get-CommandRecords $evidenceFile $evidenceRoot $started
         Invoke-ExpectedFailure { Assert-NativeTestEvidence $mismatchedRecords 'gmp' 'entry' $evidenceRoot } 'mismatched-check-action'
+        Set-Content -LiteralPath $evidenceFile -Value ($evidenceLine -replace '\|0\|logs\\check\.log\|', '|1|logs\check.log|')
+        $failedCommandRecords = Get-CommandRecords $evidenceFile $evidenceRoot $started
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $failedCommandRecords 'gmp' 'entry' $evidenceRoot } 'failed-check-command'
+        Set-Content -LiteralPath $evidenceFile -Value ($evidenceLine -replace '"C:\\Program Files\\Microsoft Visual Studio\\VC\\Tools\\MSVC\\bin\\Hostx64\\x64\\nmake\.exe"', '"tools\nmake.exe"')
+        $relativeCommandRecords = Get-CommandRecords $evidenceFile $evidenceRoot $started
+        Invoke-ExpectedFailure { Assert-NativeTestEvidence $relativeCommandRecords 'gmp' 'entry' $evidenceRoot } 'relative-nmake-command'
         Remove-Item -LiteralPath $evidenceLog
         Invoke-ExpectedFailure { Get-CommandRecords $evidenceFile $evidenceRoot $started } 'missing-check-log'
 

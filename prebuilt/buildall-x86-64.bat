@@ -1,9 +1,14 @@
 @ECHO OFF
 SETLOCAL EnableExtensions DisableDelayedExpansion
-REM The NMake recipes invoke freshly built helper executables by basename.
-SET "NoDefaultCurrentDirectoryInExePath="
+SET "NoDefaultCurrentDirectoryInExePath=1"
 
 SET "SCRIPT_ROOT=%~dp0"
+SET "POWERSHELL_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+IF DEFINED PROCESSOR_ARCHITEW6432 SET "POWERSHELL_EXE=%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+IF NOT EXIST "%POWERSHELL_EXE%" (
+  ECHO ERROR: trusted Windows PowerShell was not found at "%POWERSHELL_EXE%".
+  EXIT /B 88
+)
 SET "REPO_ROOT=%SCRIPT_ROOT%.."
 SET "SOURCES_FILE=%SCRIPT_ROOT%sources.json"
 SET "MANIFEST_WRITER=%SCRIPT_ROOT%write-manifest.ps1"
@@ -25,8 +30,8 @@ SET "MPFR_GMP_SOURCE=%GMP_SOURCE%"
 SET "NATIVE_OS_ARCH="
 SET "TEST_TARGET="
 
-FOR /F %%I IN ('powershell -NoProfile -Command "[DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')"') DO SET "RUN_ID=x64-%%I"
-FOR /F %%I IN ('powershell -NoProfile -Command "[DateTime]::UtcNow.ToString('o')"') DO SET "RUN_START=%%I"
+FOR /F %%I IN ('%POWERSHELL_EXE% -NoProfile -Command "[DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')"') DO SET "RUN_ID=x64-%%I"
+FOR /F %%I IN ('%POWERSHELL_EXE% -NoProfile -Command "[DateTime]::UtcNow.ToString('o')"') DO SET "RUN_START=%%I"
 
 :PARSE_ARGS
 IF "%~1"=="" GOTO ARGS_DONE
@@ -80,16 +85,16 @@ IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 SET "CURRENT_ENTRY=preflight"
 CALL :RUN_PREFLIGHT
 IF NOT "%RUN_RC%"=="0" GOTO FAILED
-CALL :RUN powershell -NoProfile -Command "$p=New-Object Diagnostics.Process; $p.StartInfo.FileName='cl.exe'; $p.StartInfo.UseShellExecute=$false; $p.StartInfo.RedirectStandardError=$true; $p.StartInfo.RedirectStandardOutput=$true; [void]$p.Start(); $o=$p.StandardError.ReadToEnd()+$p.StandardOutput.ReadToEnd(); $p.WaitForExit(); Write-Host $o; if($o -notmatch 'for x64'){exit 86}"
+CALL :RUN "%POWERSHELL_EXE%" -NoProfile -Command "$p=New-Object Diagnostics.Process; $p.StartInfo.FileName='cl.exe'; $p.StartInfo.UseShellExecute=$false; $p.StartInfo.RedirectStandardError=$true; $p.StartInfo.RedirectStandardOutput=$true; [void]$p.Start(); $o=$p.StandardError.ReadToEnd()+$p.StandardOutput.ReadToEnd(); $p.WaitForExit(); Write-Host $o; if($o -notmatch 'for x64'){exit 86}"
 IF NOT "%RUN_RC%"=="0" GOTO FAILED
 
 CALL :RUN_CD_GMP
 IF NOT "%RUN_RC%"=="0" GOTO FAILED
-CALL :RUN nmake /f win64\Makefile patch
+CALL :RUN_NMAKE /f win64\Makefile patch
 IF NOT "%RUN_RC%"=="0" GOTO FAILED
 CALL :RUN_CD_MPFR
 IF NOT "%RUN_RC%"=="0" GOTO FAILED
-CALL :RUN nmake /f win64\Makefile patch
+CALL :RUN_NMAKE /f win64\Makefile patch
 IF NOT "%RUN_RC%"=="0" GOTO FAILED
 
 CALL :MAYBE_STATIC debug_static_noassembly "DEBUG=" "DEBUG=" yes
@@ -141,12 +146,12 @@ SET "WITH_MPFR=%~4"
 ECHO BUILDING: %CURRENT_ENTRY%
 CALL :RUN_CD_GMP
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
-CALL :RUN nmake /f win64\Makefile clean
+CALL :RUN_NMAKE /f win64\Makefile clean
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 SET "RUN_ACTION=build-link"
 IF DEFINED TEST_TARGET SET "RUN_ACTION=build-check"
 SET "RUN_LIBRARY=gmp"
-CALL :RUN nmake /f win64\Makefile %GMP_FLAGS% static_lib %TEST_TARGET%
+CALL :RUN_NMAKE /f win64\Makefile %GMP_FLAGS% static_lib %TEST_TARGET%
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 CALL :RUN_MKDIR_ENTRY
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
@@ -155,7 +160,7 @@ IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 IF /I NOT "%WITH_MPFR%"=="yes" GOTO BUILD_STATIC_GMP_ONLY
 CALL :RUN_CD_MPFR
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
-CALL :RUN nmake /f win64\Makefile clean
+CALL :RUN_NMAKE /f win64\Makefile clean
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 CALL :ENSURE_GMP_ALIAS
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
@@ -163,10 +168,10 @@ SET "RUN_ACTION=build-link"
 IF DEFINED TEST_TARGET SET "RUN_ACTION=build-check"
 SET "RUN_LIBRARY=mpfr"
 IF DEFINED GMP_ALIAS_CREATED GOTO BUILD_STATIC_WITH_ALIAS
-CALL :RUN nmake /f win64\Makefile %MPFR_FLAGS% LIBGMP_BUILDDIR="%GMP_SOURCE%" static_lib %TEST_TARGET%
+CALL :RUN_NMAKE /f win64\Makefile %MPFR_FLAGS% LIBGMP_BUILDDIR="%GMP_SOURCE%" static_lib %TEST_TARGET%
 GOTO BUILD_STATIC_MPFR_DONE
 :BUILD_STATIC_WITH_ALIAS
-CALL :RUN nmake /f win64\Makefile %MPFR_FLAGS% LIBGMP_BUILDDIR=%MPFR_GMP_SOURCE% static_lib %TEST_TARGET%
+CALL :RUN_NMAKE /f win64\Makefile %MPFR_FLAGS% LIBGMP_BUILDDIR=%MPFR_GMP_SOURCE% static_lib %TEST_TARGET%
 :BUILD_STATIC_MPFR_DONE
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 CALL :REMOVE_GMP_ALIAS
@@ -190,12 +195,12 @@ SET "WITH_MPFR=%~4"
 ECHO BUILDING: %CURRENT_ENTRY%
 CALL :RUN_CD_GMP
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
-CALL :RUN nmake /f win64\Makefile clean
+CALL :RUN_NMAKE /f win64\Makefile clean
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 SET "RUN_ACTION=build-link"
 IF DEFINED TEST_TARGET SET "RUN_ACTION=build-check"
 SET "RUN_LIBRARY=gmp"
-CALL :RUN nmake /f win64\Makefile %GMP_FLAGS% dynamic_lib %TEST_TARGET%
+CALL :RUN_NMAKE /f win64\Makefile %GMP_FLAGS% dynamic_lib %TEST_TARGET%
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 CALL :RUN_MKDIR_ENTRY
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
@@ -206,7 +211,7 @@ IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 IF /I NOT "%WITH_MPFR%"=="yes" GOTO BUILD_DYNAMIC_GMP_ONLY
 CALL :RUN_CD_MPFR
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
-CALL :RUN nmake /f win64\Makefile clean
+CALL :RUN_NMAKE /f win64\Makefile clean
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 CALL :ENSURE_GMP_ALIAS
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
@@ -214,10 +219,10 @@ SET "RUN_ACTION=build-link"
 IF DEFINED TEST_TARGET SET "RUN_ACTION=build-check"
 SET "RUN_LIBRARY=mpfr"
 IF DEFINED GMP_ALIAS_CREATED GOTO BUILD_DYNAMIC_WITH_ALIAS
-CALL :RUN nmake /f win64\Makefile %MPFR_FLAGS% LIBGMP_BUILDDIR="%GMP_SOURCE%" dynamic_lib %TEST_TARGET%
+CALL :RUN_NMAKE /f win64\Makefile %MPFR_FLAGS% LIBGMP_BUILDDIR="%GMP_SOURCE%" dynamic_lib %TEST_TARGET%
 GOTO BUILD_DYNAMIC_MPFR_DONE
 :BUILD_DYNAMIC_WITH_ALIAS
-CALL :RUN nmake /f win64\Makefile %MPFR_FLAGS% LIBGMP_BUILDDIR=%MPFR_GMP_SOURCE% dynamic_lib %TEST_TARGET%
+CALL :RUN_NMAKE /f win64\Makefile %MPFR_FLAGS% LIBGMP_BUILDDIR=%MPFR_GMP_SOURCE% dynamic_lib %TEST_TARGET%
 :BUILD_DYNAMIC_MPFR_DONE
 IF NOT "%RUN_RC%"=="0" EXIT /B %RUN_RC%
 CALL :REMOVE_GMP_ALIAS
@@ -308,21 +313,21 @@ ENDLOCAL & SET "RUN_RC=%RC%" & SET "COMMAND_LOG=%COMMAND_LOG%" & SET "LOG_ROOT=%
 
 :RUN_PREFLIGHT
 SETLOCAL DisableDelayedExpansion
-CALL :RUN powershell -NoProfile -ExecutionPolicy Bypass -File "%MANIFEST_WRITER%" -ValidateSourcesOnly -SourcesFile "%SOURCES_FILE%" -StagingRoot "%OUTPUT_ROOT%" -GmpSource "%GMP_SOURCE%" -MpfrSource "%MPFR_SOURCE%" -RunStartUtc "%RUN_START%" -RunId "%RUN_ID%" -Architecture "%TARGET_ARCH%" %ALLOW_DIRTY%
+CALL :RUN "%POWERSHELL_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%MANIFEST_WRITER%" -ValidateSourcesOnly -SourcesFile "%SOURCES_FILE%" -StagingRoot "%OUTPUT_ROOT%" -GmpSource "%GMP_SOURCE%" -MpfrSource "%MPFR_SOURCE%" -RunStartUtc "%RUN_START%" -RunId "%RUN_ID%" -Architecture "%TARGET_ARCH%" %ALLOW_DIRTY%
 SET "RC=%RUN_RC%"
 SET "RUN_CWD=%CD%"
 ENDLOCAL & CD /D "%RUN_CWD%" >NUL & SET "COMMAND_INDEX=%COMMAND_INDEX%" & SET "RUN_RC=%RC%" & SET "RUN_ACTION=" & SET "RUN_LIBRARY=" & EXIT /B %RC%
 
 :RUN_AGGREGATE
 SETLOCAL DisableDelayedExpansion
-CALL :RUN powershell -NoProfile -ExecutionPolicy Bypass -File "%MANIFEST_WRITER%" -Aggregate -SourcesFile "%SOURCES_FILE%" -StagingRoot "%OUTPUT_ROOT%" -RunId "%RUN_ID%"
+CALL :RUN "%POWERSHELL_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%MANIFEST_WRITER%" -Aggregate -SourcesFile "%SOURCES_FILE%" -StagingRoot "%OUTPUT_ROOT%" -RunId "%RUN_ID%"
 SET "RC=%RUN_RC%"
 SET "RUN_CWD=%CD%"
 ENDLOCAL & CD /D "%RUN_CWD%" >NUL & SET "COMMAND_INDEX=%COMMAND_INDEX%" & SET "RUN_RC=%RC%" & SET "RUN_ACTION=" & SET "RUN_LIBRARY=" & EXIT /B %RC%
 
 :RUN_WRITE_MANIFEST
 SETLOCAL DisableDelayedExpansion
-CALL :RUN powershell -NoProfile -ExecutionPolicy Bypass -File "%MANIFEST_WRITER%" -SourcesFile "%SOURCES_FILE%" -StagingRoot "%OUTPUT_ROOT%" -GmpSource "%GMP_SOURCE%" -MpfrSource "%MPFR_SOURCE%" -RunStartUtc "%RUN_START%" -RunId "%RUN_ID%" -Architecture "%TARGET_ARCH%" -Entry "%CURRENT_ENTRY%" -MakeVariables "%GMP_FLAGS%;;%MPFR_FLAGS%" -CommandLog "%COMMAND_LOG%" -ArtifactSpec "%ARTIFACT_SPECS%" %ALLOW_DIRTY%
+CALL :RUN "%POWERSHELL_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%MANIFEST_WRITER%" -SourcesFile "%SOURCES_FILE%" -StagingRoot "%OUTPUT_ROOT%" -GmpSource "%GMP_SOURCE%" -MpfrSource "%MPFR_SOURCE%" -RunStartUtc "%RUN_START%" -RunId "%RUN_ID%" -Architecture "%TARGET_ARCH%" -Entry "%CURRENT_ENTRY%" -MakeVariables "%GMP_FLAGS%;;%MPFR_FLAGS%" -CommandLog "%COMMAND_LOG%" -ArtifactSpec "%ARTIFACT_SPECS%" %ALLOW_DIRTY%
 SET "RC=%RUN_RC%"
 SET "RUN_CWD=%CD%"
 ENDLOCAL & CD /D "%RUN_CWD%" >NUL & SET "COMMAND_INDEX=%COMMAND_INDEX%" & SET "RUN_RC=%RC%" & SET "RUN_ACTION=" & SET "RUN_LIBRARY=" & EXIT /B %RC%
@@ -374,7 +379,7 @@ ENDLOCAL & SET "GMP_ALIAS_NEEDED=1" & EXIT /B 0
 :DETECT_NATIVE_OS_ARCH
 SETLOCAL DisableDelayedExpansion
 SET "ARCH="
-FOR /F "delims=" %%I IN ('powershell -NoProfile -Command "try{$a=[Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString();if([string]::IsNullOrWhiteSpace($a)){exit 1};$a}catch{exit 1}"') DO IF NOT DEFINED ARCH SET "ARCH=%%I"
+FOR /F "delims=" %%I IN ('%POWERSHELL_EXE% -NoProfile -Command "try{$a=[Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString();if([string]::IsNullOrWhiteSpace($a)){exit 1};$a}catch{exit 1}"') DO IF NOT DEFINED ARCH SET "ARCH=%%I"
 IF NOT DEFINED ARCH (
   ECHO ERROR: unable to determine the native Windows OS architecture.
   ENDLOCAL & SET "RUN_RC=87" & EXIT /B 87
@@ -400,6 +405,21 @@ SETLOCAL DisableDelayedExpansion
 ECHO SUCCESS: %BUILT_COUNT% x64 matrix entry or entries staged at "%OUTPUT_ROOT%".
 ENDLOCAL & EXIT /B 0
 
+:RUN_NMAKE
+SETLOCAL DisableDelayedExpansion
+SET "NMAKE_EXE="
+FOR %%I IN (nmake.exe nmake.com nmake.bat nmake.cmd) DO IF NOT DEFINED NMAKE_EXE SET "NMAKE_EXE=%%~$PATH:I"
+IF NOT DEFINED NMAKE_EXE GOTO RUN_NMAKE_MISSING
+SET "PATH=%PATH%;%CD%"
+CALL :RUN "%NMAKE_EXE%" %*
+GOTO RUN_NMAKE_DONE
+:RUN_NMAKE_MISSING
+CALL :RUN nmake %*
+:RUN_NMAKE_DONE
+SET "RC=%RUN_RC%"
+SET "RUN_CWD=%CD%"
+ENDLOCAL & CD /D "%RUN_CWD%" >NUL & SET "COMMAND_INDEX=%COMMAND_INDEX%" & SET "RUN_RC=%RC%" & SET "RUN_ACTION=" & SET "RUN_LIBRARY=" & EXIT /B %RC%
+
 :RUN
 SETLOCAL DisableDelayedExpansion
 IF NOT DEFINED RUN_ACTION SET "RUN_ACTION=command"
@@ -413,7 +433,7 @@ ECHO [%CURRENT_ENTRY%] ^> %*
 SET "RUN_RC=%ERRORLEVEL%"
 SET "RUN_CWD=%CD%"
 TYPE "%LOG_ROOT%\%LOG_NAME%"
-FOR /F %%I IN ('powershell -NoProfile -Command "[DateTime]::UtcNow.ToString('o')"') DO SET "STAMP=%%I"
+FOR /F %%I IN ('%POWERSHELL_EXE% -NoProfile -Command "[DateTime]::UtcNow.ToString('o')"') DO SET "STAMP=%%I"
 >>"%COMMAND_LOG%" ECHO(%STAMP%^|%CURRENT_ENTRY%^|%RUN_ACTION%^|%RUN_LIBRARY%^|%RUN_RC%^|%LOG_REL%^|%*
 IF NOT "%RUN_RC%"=="0" ECHO ERROR: [%CURRENT_ENTRY%] command failed with exit code %RUN_RC%.
 ENDLOCAL & CD /D "%RUN_CWD%" >NUL & SET "COMMAND_INDEX=%COMMAND_INDEX%" & SET "RUN_RC=%RUN_RC%" & SET "RUN_ACTION=" & SET "RUN_LIBRARY=" & EXIT /B %RUN_RC%
@@ -422,8 +442,11 @@ ENDLOCAL & CD /D "%RUN_CWD%" >NUL & SET "COMMAND_INDEX=%COMMAND_INDEX%" & SET "R
 SETLOCAL DisableDelayedExpansion
 SET "OUTPUT_ROOT=%SCRIPT_ROOT%.test-work\fail-fast-%RUN_ID%"
 SET "BANG_DIR=%OUTPUT_ROOT%\literal!"
+SET "TRUSTED_TOOL_DIR=%OUTPUT_ROOT%\trusted tools"
 IF EXIST "%OUTPUT_ROOT%" RMDIR /S /Q "%OUTPUT_ROOT%"
 MKDIR "%OUTPUT_ROOT%\logs"
+IF ERRORLEVEL 1 EXIT /B %ERRORLEVEL%
+MKDIR "%TRUSTED_TOOL_DIR%"
 IF ERRORLEVEL 1 EXIT /B %ERRORLEVEL%
 SET "COMMAND_LOG=%OUTPUT_ROOT%\commands.tsv"
 SET "LOG_ROOT=%OUTPUT_ROOT%\logs"
@@ -435,13 +458,46 @@ IF NOT EXIST "%BANG_DIR%\" (
   GOTO SELF_TEST_DONE
 )
 >"%BANG_DIR%\known.file" ECHO known
+COPY /Y "%SystemRoot%\System32\where.exe" "%BANG_DIR%\powershell.exe" >NUL
+IF ERRORLEVEL 1 (
+  SET "RUN_RC=97"
+  GOTO SELF_TEST_DONE
+)
+COPY /Y "%SystemRoot%\System32\where.exe" "%BANG_DIR%\nmake.exe" >NUL
+IF ERRORLEVEL 1 (
+  SET "RUN_RC=98"
+  GOTO SELF_TEST_DONE
+)
+COPY /Y "%ComSpec%" "%TRUSTED_TOOL_DIR%\nmake.exe" >NUL
+IF ERRORLEVEL 1 (
+  SET "RUN_RC=103"
+  GOTO SELF_TEST_DONE
+)
+>"%BANG_DIR%\colored_print.cmd" ECHO @ECHO helper^>"%OUTPUT_ROOT%\helper.marker"
+>>"%BANG_DIR%\colored_print.cmd" ECHO @ECHO trusted^>"%OUTPUT_ROOT%\trusted-nmake.marker"
+SET "PATH=%TRUSTED_TOOL_DIR%;%PATH%"
 CALL :RUN CD /D "%BANG_DIR%"
 IF NOT "%RUN_RC%"=="0" GOTO SELF_TEST_DONE
 CALL :RUN cmd /d /c cd
 IF NOT "%RUN_RC%"=="0" GOTO SELF_TEST_DONE
-CALL :RUN powershell -NoProfile -Command "if(Test-Path -LiteralPath '.\known.file'){exit 0}else{exit 92}"
+CALL :RUN "%POWERSHELL_EXE%" -NoProfile -Command "if(Test-Path -LiteralPath '.\known.file'){exit 0}else{exit 92}"
 IF NOT "%RUN_RC%"=="0" GOTO SELF_TEST_DONE
-powershell -NoProfile -Command "$lines=[IO.File]::ReadAllLines($env:COMMAND_LOG); $logs=@($lines|%%{($_ -split '\|')[5]}|Select-Object -Unique); if($lines.Count -ne 4 -or $logs.Count -ne 4 -or -not (($lines -join [Environment]::NewLine).Contains($env:BANG_DIR))){exit 1}"
+SET "PATH_BEFORE_NMAKE=%PATH%"
+CALL :RUN_NMAKE /d /c colored_print
+IF NOT "%RUN_RC%"=="0" GOTO SELF_TEST_DONE
+IF NOT "%PATH%"=="%PATH_BEFORE_NMAKE%" (
+  SET "RUN_RC=100"
+  GOTO SELF_TEST_DONE
+)
+IF NOT EXIST "%OUTPUT_ROOT%\trusted-nmake.marker" (
+  SET "RUN_RC=101"
+  GOTO SELF_TEST_DONE
+)
+IF NOT EXIST "%OUTPUT_ROOT%\helper.marker" (
+  SET "RUN_RC=102"
+  GOTO SELF_TEST_DONE
+)
+"%POWERSHELL_EXE%" -NoProfile -Command "$lines=[IO.File]::ReadAllLines($env:COMMAND_LOG); $logs=@($lines|%%{($_ -split '\|')[5]}|Select-Object -Unique); if($lines.Count -ne 5 -or $logs.Count -ne 5 -or -not (($lines -join [Environment]::NewLine).Contains($env:BANG_DIR))){exit 1}"
 IF ERRORLEVEL 1 (
   SET "RUN_RC=91"
   GOTO SELF_TEST_DONE
