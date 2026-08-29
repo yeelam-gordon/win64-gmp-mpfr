@@ -5,13 +5,21 @@ Run this only on a **native Windows Arm64 machine** after cloning the fork.
 ## Start
 
 ```powershell
-git clone https://github.com/yeelam-gordon/win64-gmp-mpfr.git
+git clone --filter=blob:none --no-checkout https://github.com/yeelam-gordon/win64-gmp-mpfr.git
 Set-Location .\win64-gmp-mpfr
+git sparse-checkout init --no-cone
+@'
+/*
+!/prebuilt/x86-64/
+'@ | git sparse-checkout set --no-cone --stdin
 git fetch origin
 git switch hackathon/arm64-validation-demo
 git pull --ff-only
 copilot --yolo --experimental --autopilot
 ```
+
+This keeps the Arm64 prebuilts and all source/demo files while excluding the approximately
+80 MB x86-64 prebuilt directory from the working copy and on-demand blob download.
 
 Paste the prompt below into Copilot CLI:
 
