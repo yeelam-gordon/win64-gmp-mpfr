@@ -1,0 +1,85 @@
+{
+  "schemaVersion": "gmp-mpfr-hackathon-evidence/v2",
+  "generatedAt": "2026-08-29T01:51:46.117+08:00",
+  "sourceDocument": "../impact-evidence.md",
+  "review": {
+    "status": "CONVERGED",
+    "head": "9fad07a3e5255e805374863ec91498499608b5b3",
+    "copilotReviewSubmissions": 13,
+    "newComments": 0,
+    "openThreads": 0
+  },
+  "upstream": {
+    "pullRequest": "https://github.com/developer-corner/win64-gmp-mpfr/pull/1",
+    "status": "DRAFT",
+    "accepted": false,
+    "merged": false,
+    "signed": false,
+    "published": false
+  },
+  "selfTests": {
+    "manifest": "PASS",
+    "failFast": "PASS",
+    "scope": "Evidence machinery only; not GMP/MPFR suite certification."
+  },
+  "x64": {
+    "status": "UNRESOLVED",
+    "sourceBuildsReachedTestSuites": true,
+    "existingRunnerExitCode": 0,
+    "runnerExitInterpretation": "FALSE_SUCCESS_SIGNAL",
+    "gmp": {
+      "overall": 200,
+      "succeeded": 138,
+      "failed": 61,
+      "skipped": 1,
+      "suiteStatus": "FAIL"
+    },
+    "mpfr": {
+      "overall": 197,
+      "succeeded": 172,
+      "failed": 18,
+      "skipped": 7,
+      "suiteStatus": "FAIL"
+    },
+    "validator": {
+      "ansiStripping": true,
+      "summaryParsing": true,
+      "rejectsNonzeroFailures": true,
+      "result": "REJECTED",
+      "exitCode": "NONZERO",
+      "certifyingManifestEmitted": false
+    },
+    "certification": "NOT_GRANTED",
+    "consumerCorrectnessFromCertifiedArtifacts": "NOT_ESTABLISHED",
+    "finalArtifactHashes": null,
+    "finalArtifactSizes": null
+  },
+  "arm64Native": {
+    "status": "PENDING",
+    "requiredHost": "Native Windows Arm64 machine",
+    "runId": null,
+    "gmpSummary": null,
+    "mpfrSummary": null,
+    "consumerEvidence": null,
+    "certifyingManifest": null
+  },
+  "claimPolicy": {
+    "x64TestsPassedMayBeClaimed": false,
+    "nativeArm64SuccessMayBeClaimed": false,
+    "performanceMeasured": false,
+    "powerMeasured": false,
+    "signed": false,
+    "published": false,
+    "downstreamUnblockingConfirmed": false
+  },
+  "supersededEvidence": {
+    "nativeTestsPassedLabels": "REMOVED",
+    "oldArtifactHashesAndSizesAsFinalEvidence": "REMOVED",
+    "certifiedConsumerCorrectness": "REMOVED"
+  },
+  "confidence": {
+    "reviewAndValidatorResult": "HIGH",
+    "platformReadiness": "MEDIUM",
+    "reason": "x64 test failures remain unresolved and native Windows Arm64 validation has not run."
+  }
+}

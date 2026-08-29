@@ -1,0 +1,100 @@
+/* slidecast — style presets.
+   Each preset is a body class `.theme-<name>` that sets --sc-* design tokens consumed by deck.html
+   and the partials. Swap the look of an entire deck by changing one body class.
+   Tokens: --sc-bg, --sc-fg, --sc-muted, --sc-accent, --sc-accent2, --sc-surface, --sc-border,
+   --sc-radius, --sc-font-head, --sc-font-body, --sc-font-code, --sc-motion (0..3), --sc-density (1..5).
+   See references/style-gallery.md for when to auto-suggest each. */
+
+:root {
+  /* sensible fallbacks (≈ minimalKeynote) */
+  --sc-bg:#ffffff; --sc-fg:#1d1d1f; --sc-muted:#6e6e73;
+  --sc-accent:#0071e3; --sc-accent2:#00a3a1;
+  --sc-surface:rgba(0,0,0,.04); --sc-border:rgba(0,0,0,.12);
+  --sc-radius:14px;
+  --sc-font-head:"Inter","SF Pro Display",-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;
+  --sc-font-body:"Inter",-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;
+  --sc-font-code:"JetBrains Mono","Fira Code",Consolas,"Courier New",monospace;
+  --sc-motion:1; --sc-density:2;
+  --sc-bg-image:none;
+  /* shared design tokens (themes override where needed) */
+  --sc-accent-fg:#ffffff;
+  --sc-accent-soft:color-mix(in srgb, var(--sc-accent) 12%, transparent);
+  --sc-success:#16a34a; --sc-danger:#dc2626;
+  --sc-shadow:0 1px 2px rgba(16,24,40,.06), 0 8px 24px rgba(16,24,40,.06);
+  --sc-shadow-lg:0 24px 60px rgba(16,24,40,.18);
+  --sc-orb-opacity:.16;
+}
+/* dark decks get deeper, softer shadows and a fainter orb */
+.theme-pitchDeck, .theme-devDark, .theme-saasGradient {
+  --sc-shadow:0 1px 2px rgba(0,0,0,.4), 0 12px 32px rgba(0,0,0,.36);
+  --sc-shadow-lg:0 30px 70px rgba(0,0,0,.5);
+  --sc-orb-opacity:.22;
+}
+
+/* 1. Minimal / Apple Keynote */
+.theme-minimalKeynote{
+  --sc-bg:#ffffff; --sc-fg:#1d1d1f; --sc-muted:#6e6e73; --sc-accent:#0071e3; --sc-accent2:#34c759;
+  --sc-surface:rgba(0,0,0,.04); --sc-border:rgba(0,0,0,.10); --sc-radius:0;
+  --sc-font-head:"Inter","SF Pro Display",-apple-system,sans-serif; --sc-font-body:"Inter",sans-serif;
+  --sc-motion:1; --sc-density:1;
+}
+.theme-minimalKeynote.dark{ --sc-bg:#000; --sc-fg:#f5f5f7; --sc-muted:#86868b; --sc-surface:rgba(255,255,255,.06); --sc-border:rgba(255,255,255,.12); }
+
+/* 2. Consulting Report (McKinsey/BCG) */
+.theme-consultingReport{
+  --sc-bg:#ffffff; --sc-fg:#0a2540; --sc-muted:#667085; --sc-accent:#00a3a1; --sc-accent2:#0a2540;
+  --sc-surface:#f7f9fb; --sc-border:#d0d5dd; --sc-radius:2px;
+  --sc-font-head:Georgia,"Times New Roman",serif; --sc-font-body:Arial,"Helvetica Neue",sans-serif;
+  --sc-motion:0; --sc-density:5;
+}
+
+/* 3. Startup Pitch (Sequoia/YC) */
+.theme-pitchDeck{
+  --sc-bg:#0e1116; --sc-fg:#ffffff; --sc-muted:#9aa4b2; --sc-accent:#635bff; --sc-accent2:#16c79a;
+  --sc-surface:rgba(255,255,255,.06); --sc-border:rgba(255,255,255,.14); --sc-radius:12px;
+  --sc-font-head:"Inter",sans-serif; --sc-font-body:"Inter",system-ui,sans-serif;
+  --sc-motion:2; --sc-density:2;
+}
+
+/* 4. Developer Dark (Dracula) */
+.theme-devDark{
+  --sc-bg:#282a36; --sc-fg:#f8f8f2; --sc-muted:#6272a4; --sc-accent:#bd93f9; --sc-accent2:#50fa7b;
+  --sc-surface:rgba(255,255,255,.04); --sc-border:rgba(255,255,255,.10); --sc-radius:8px;
+  --sc-font-head:"Inter",-apple-system,sans-serif; --sc-font-body:"Inter",sans-serif;
+  --sc-font-code:"Fira Code","JetBrains Mono",Consolas,monospace;
+  --sc-motion:1; --sc-density:3;
+}
+
+/* 5. Editorial / Magazine */
+.theme-editorial{
+  --sc-bg:#faf8f4; --sc-fg:#1a1a1a; --sc-muted:#6b6b6b; --sc-accent:#b8462f; --sc-accent2:#1a1a1a;
+  --sc-surface:#f2ede3; --sc-border:#e0d8c8; --sc-radius:0;
+  --sc-font-head:"Playfair Display",Georgia,serif; --sc-font-body:"Inter",sans-serif;
+  --sc-motion:2; --sc-density:2;
+}
+
+/* 6. SaaS Gradient / Glass */
+.theme-saasGradient{
+  --sc-bg:#1a1340; --sc-bg-image:linear-gradient(135deg,#6d5efc 0%,#b06ab3 50%,#ff8b8b 100%);
+  --sc-fg:#ffffff; --sc-muted:rgba(255,255,255,.78); --sc-accent:#00d4ff; --sc-accent2:#635bff;
+  --sc-surface:rgba(255,255,255,.12); --sc-border:rgba(255,255,255,.22); --sc-radius:20px;
+  --sc-font-head:"Inter",sans-serif; --sc-font-body:"Inter",sans-serif;
+  --sc-motion:3; --sc-density:2;
+}
+.theme-saasGradient .card{ backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px); }
+
+/* 7. Playful / Education */
+.theme-playfulEdu{
+  --sc-bg:#fff7ed; --sc-fg:#2b2d42; --sc-muted:#5b5d72; --sc-accent:#ef476f; --sc-accent2:#06d6a0;
+  --sc-accent3:#ffd166; --sc-surface:#ffffff; --sc-border:#ffe0c2; --sc-radius:24px;
+  --sc-font-head:"Poppins","Baloo 2",sans-serif; --sc-font-body:"Nunito","Poppins",sans-serif;
+  --sc-motion:3; --sc-density:2;
+}
+
+/* 8. Data-Journalism Editorial (paged variant) */
+.theme-editorialData{
+  --sc-bg:#ffffff; --sc-fg:#121212; --sc-muted:#666666; --sc-accent:#e2562b; --sc-accent2:#121212;
+  --sc-surface:#f6f6f6; --sc-border:#e6e6e6; --sc-radius:4px;
+  --sc-font-head:Georgia,"Tiempos",serif; --sc-font-body:"Inter",sans-serif;
+  --sc-motion:2; --sc-density:4;
+}

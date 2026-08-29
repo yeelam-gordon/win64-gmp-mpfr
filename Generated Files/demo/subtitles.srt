@@ -1,0 +1,51 @@
+1
+00:00:00,000 --> 00:00:13,000
+GMP and MPFR provide arbitrary-precision arithmetic used across CAD, geometry, security, and scientific software. For Windows Arm, the challenge is not merely producing binaries. It is proving which source was built, which tests ran, and whether the result deserves certification.
+
+2
+00:00:13,000 --> 00:00:26,000
+The project first corrected its premise. Community Arm64 paths and earlier vcpkg support already existed, so this work does not claim first-time Windows Arm support. The objective became a fail-closed evidence path rather than a new platform-support claim.
+
+3
+00:00:26,000 --> 00:00:40,000
+The trust gaps were concrete: weak source identity, hidden command failures, inconsistent full-64-bit configuration, and no reliable binding between test outcomes and a certifying manifest. Existing binaries and earlier apparent successes could not settle those questions.
+
+4
+00:00:40,000 --> 00:00:54,000
+The fork review loop then converged on HEAD 9fad07a3e5255e805374863ec91498499608b5b3. Thirteen Copilot review submissions produced zero new comments and left zero open threads. The corresponding upstream contribution is draft pull request number one.
+
+5
+00:00:54,000 --> 00:01:07,000
+The provenance and fail-fast self-tests pass. Those checks establish that the machinery can reject controlled errors and handle its manifest rules. They do not prove that GMP or MPFR passed their native test suites.
+
+6
+00:01:07,000 --> 00:01:20,000
+Full native x64 source builds reach both test suites. However, the existing Windows test runner returns exit zero even when its own summaries contain failures. Exit status alone therefore creates a false-success signal.
+
+7
+00:01:20,000 --> 00:01:32,000
+For GMP, the parsed summary reports 200 tests overall: 138 succeeded, 61 failed, and one skipped. This is not a passing GMP test result, even though the surrounding runner returned zero.
+
+8
+00:01:32,000 --> 00:01:44,000
+For MPFR, the parsed summary reports 197 tests overall: 172 succeeded, 18 failed, and seven skipped. This is also not a passing MPFR test result.
+
+9
+00:01:44,000 --> 00:01:57,000
+The new validator strips ANSI control sequences, parses both summaries, and rejects any nonzero failure count. On this evidence it exits nonzero and emits no certifying manifest. That detection is the verified project result.
+
+10
+00:01:57,000 --> 00:02:10,000
+The x64 gate is therefore unresolved, but now diagnosed honestly. Earlier artifact sizes, hashes, native-tests-passed labels, and consumer checks must not be presented as certification evidence from a passing build.
+
+11
+00:02:10,000 --> 00:02:21,000
+The contribution is visible for review in upstream draft pull request one at developer-corner slash win64-gmp-mpfr. Draft status is not acceptance, merge, signing, release, or publication.
+
+12
+00:02:21,000 --> 00:02:34,000
+No performance, power, signing, publication, certification, or downstream-unblocking claim is supported. The value delivered is stricter evidence handling: a misleading zero exit can no longer create a certifying manifest.
+
+13
+00:02:34,000 --> 00:02:50,000
+Two gates remain. First, diagnose and fix the x64 test failures, then obtain clean summaries through the validator. Second, run the locked build and test process on a native Windows Arm64 machine. Until both gates close, x64 certification is unresolved and native Arm64 proof remains pending.
